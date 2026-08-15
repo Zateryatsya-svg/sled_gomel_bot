@@ -473,6 +473,27 @@ async def cmd_gencode(message: Message, command: CommandObject, bot: Bot):
         await message.answer(text)
 
 
+@router.message(Command("amiadmin"))
+async def cmd_amiadmin(message: Message):
+    """Диагностическая команда — доступна всем, показывает, видит ли бот
+    отправителя как админа. Помогает проверить настройку ADMIN_IDS без
+    необходимости лезть в Railway и разглядывать скриншоты."""
+    uid = message.from_user.id
+    if uid in ADMIN_IDS:
+        await message.answer(
+            f"✅ Да, бот видит тебя как админа.\n\nТвой id: <code>{uid}</code>\n"
+            f"Список админов сейчас: {', '.join(str(a) for a in sorted(ADMIN_IDS))}"
+        )
+    else:
+        admins_list = ", ".join(str(a) for a in sorted(ADMIN_IDS)) if ADMIN_IDS else "пусто (переменная ADMIN_IDS не настроена или не сработала)"
+        await message.answer(
+            f"❌ Нет, бот НЕ видит тебя как админа — уведомления об оплате тебе приходить не будут.\n\n"
+            f"Твой настоящий id: <code>{uid}</code>\n"
+            f"Список админов, который сейчас загружен в бота: {admins_list}\n\n"
+            f"Нужно, чтобы в Railway → Variables → ADMIN_IDS было записано ровно это число: <code>{uid}</code>"
+        )
+
+
 @router.message(Command("codestats"))
 async def cmd_codestats(message: Message):
     if message.from_user.id not in ADMIN_IDS:
