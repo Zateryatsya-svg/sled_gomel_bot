@@ -486,10 +486,12 @@ async def cmd_amiadmin(message: Message):
         )
     else:
         admins_list = ", ".join(str(a) for a in sorted(ADMIN_IDS)) if ADMIN_IDS else "пусто (переменная ADMIN_IDS не настроена или не сработала)"
+        raw_env = os.getenv("ADMIN_IDS", "")
         await message.answer(
             f"❌ Нет, бот НЕ видит тебя как админа — уведомления об оплате тебе приходить не будут.\n\n"
             f"Твой настоящий id: <code>{uid}</code>\n"
-            f"Список админов, который сейчас загружен в бота: {admins_list}\n\n"
+            f"Список админов, который сейчас загружен в бота: {admins_list}\n"
+            f"Сырое значение переменной ADMIN_IDS прямо сейчас: <code>{raw_env!r}</code>\n\n"
             f"Нужно, чтобы в Railway → Variables → ADMIN_IDS было записано ровно это число: <code>{uid}</code>"
         )
 
