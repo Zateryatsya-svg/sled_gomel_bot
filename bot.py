@@ -166,8 +166,16 @@ async def begin_quest_intro(bot: Bot, chat_id: int):
 PAYMENT_QR_PATH = "assets/payment_qr.png"
 
 
+def payment_keyboard() -> InlineKeyboardMarkup | None:
+    link = CONTENT["payment"].get("payment_link")
+    if not link:
+        return None
+    label = CONTENT["payment"].get("button_label", "🎟 Оплатить")
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=label, url=link)]])
+
+
 async def send_payment_instructions(bot: Bot, chat_id: int):
-    await bot.send_message(chat_id, CONTENT["payment"]["intro"])
+    await bot.send_message(chat_id, CONTENT["payment"]["intro"], reply_markup=payment_keyboard())
     if os.path.exists(PAYMENT_QR_PATH):
         photo = FSInputFile(PAYMENT_QR_PATH)
         await bot.send_photo(chat_id, photo, caption=CONTENT["payment"].get("qr_caption", ""))
