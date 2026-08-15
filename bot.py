@@ -502,6 +502,26 @@ async def cmd_revoke(message: Message, command: CommandObject):
     )
 
 
+@router.message(Command("forgetme"))
+async def cmd_forgetme(message: Message):
+    """Полностью сбрасывает СВОЙ ЖЕ аккаунт админа до состояния 'ещё не
+    платил' — удобно для тестирования всей цепочки оплаты заново, без
+    необходимости заводить отдельный тестовый Telegram-аккаунт."""
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    uid = message.from_user.id
+    existing = await storage.get_state(uid)
+    if existing and existing.get("code"):
+        await storage.revoke_code(existing["code"])
+    fresh = storage.new_state(uid)
+    await storage.save_state(fresh)
+    await message.answer(
+        "🔄 Готово — твой аккаунт полностью сброшен, как будто ты новый "
+        "покупатель, который ещё не платил. Напиши /start, чтобы проверить "
+        "всю цепочку оплаты заново."
+    )
+
+
 @router.message(Command("progress"))
 async def cmd_progress(message: Message):
     state = await storage.get_state(message.from_user.id)
