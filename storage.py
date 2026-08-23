@@ -49,6 +49,12 @@ async def init_db():
             await db.execute("ALTER TABLE user_state ADD COLUMN code TEXT")
         except Exception:
             pass
+        # мягкая миграция: колонка для ротации фраз "Подумать самому",
+        # чтобы они не повторялись подряд у одного игрока
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN think_count INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -73,6 +79,7 @@ async def get_state(user_id: int) -> dict | None:
                 "mode": row["mode"],
                 "finished": bool(row["finished"]),
                 "code": row["code"],
+                "think_count": row["think_count"] if "think_count" in row.keys() else 0,
             }
 
 
@@ -80,15 +87,16 @@ async def save_state(state: dict):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code, think_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 step_idx = excluded.step_idx,
                 clue_idx = excluded.clue_idx,
                 letters = excluded.letters,
                 mode = excluded.mode,
                 finished = excluded.finished,
-                code = excluded.code
+                code = excluded.code,
+                think_count = excluded.think_count
             """,
             (
                 state["user_id"],
@@ -98,6 +106,7 @@ async def save_state(state: dict):
                 state["mode"],
                 int(state["finished"]),
                 state.get("code"),
+                state.get("think_count", 0),
             ),
         )
         await db.commit()
@@ -117,6 +126,7 @@ async def reset_state(user_id: int):
         "mode": None,
         "finished": False,
         "code": keep_code,
+        "think_count": 0,
     }
     await save_state(fresh)
     return fresh
@@ -131,6 +141,7 @@ def new_state(user_id: int) -> dict:
         "mode": None,
         "finished": False,
         "code": None,
+        "think_count": 0,
     }
 
 

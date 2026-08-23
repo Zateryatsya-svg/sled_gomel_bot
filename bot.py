@@ -33,7 +33,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import storage
-from answer_utils import check_answer, normalize
+from answer_utils import check_answer
 
 # ---------------------------------------------------------------------------
 # Инициализация
@@ -59,7 +59,6 @@ with open("content.json", encoding="utf-8") as f:
     CONTENT = json.load(f)
 
 STEPS = CONTENT["steps"]
-TARGET_WORD = CONTENT["target_word"]
 
 router = Router()
 
@@ -85,33 +84,35 @@ def cancel_hint_task(user_id: int):
         task.cancel()
 
 
-def progress_word(letters: list[str]) -> str:
-    """Отображение вида "С-О-К-_-_-_-_-_-_" по мере сбора букв."""
-    display = list(letters) + ["_"] * (len(TARGET_WORD) - len(letters))
-    return "-".join(display)
-
-
-def rest_keyboard() -> InlineKeyboardMarkup:
+def arrival_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=CONTENT["buttons"]["next"], callback_data="rest_next")]
+            [InlineKeyboardButton(text=CONTENT["buttons"]["arrived"], callback_data="arrived")]
         ]
     )
 
 
-def rest_question_keyboard() -> InlineKeyboardMarkup:
+def wait_ready_keyboard(label: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=CONTENT["buttons"]["skip"], callback_data="rest_next")]
+            [InlineKeyboardButton(text=label or CONTENT["buttons"]["ready"], callback_data="wait_ready")]
         ]
     )
 
 
-def mode_keyboard() -> InlineKeyboardMarkup:
+def question_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=CONTENT["modes"]["audio"], callback_data="mode_audio")],
-            [InlineKeyboardButton(text=CONTENT["modes"]["text"], callback_data="mode_text")],
+            [InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")],
+            [InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")],
+        ]
+    )
+
+
+def start_quest_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=CONTENT["intro"]["start_button"], callback_data="quest_start")]
         ]
     )
 
@@ -159,8 +160,10 @@ def normalize_code(raw: str) -> str:
 
 
 async def begin_quest_intro(bot: Bot, chat_id: int):
-    await bot.send_message(chat_id, CONTENT["intro"]["text"])
-    await bot.send_message(chat_id, CONTENT["mode_prompt"], reply_markup=mode_keyboard())
+    """Показывает вступительный текст с кнопкой «Начать квест». Само
+    расследование (step_idx=0) стартует только по нажатию этой кнопки —
+    см. cb_quest_start."""
+    await bot.send_message(chat_id, CONTENT["intro"]["text"], reply_markup=start_quest_keyboard())
 
 
 PAYMENT_QR_PATH = "assets/payment_qr.png"
@@ -295,86 +298,103 @@ async def try_activate_code(message: Message, raw_code: str):
     )
 
 
-async def schedule_hint(user_id: int, chat_id: int, bot: Bot, step: dict, step_idx_snapshot: int):
-    """Через N секунд молчания шлёт подсказку, если пользователь всё ещё на этом шаге."""
-    delay = step.get("hint_delay_sec", 30)
-    hint_text = step.get("hint")
+def current_beat(state: dict) -> dict | None:
+    """Возвращает объект текущего «бита» (шага внутри локации) или None,
+    если квест ещё не начат / уже завершён."""
+    if state["step_idx"] < 0 or state["step_idx"] >= len(STEPS):
+        return None
+    beats = STEPS[state["step_idx"]]["beats"]
+    if state["clue_idx"] >= len(beats):
+        return None
+    return beats[state["clue_idx"]]
+
+
+async def schedule_hint(user_id: int, chat_id: int, bot: Bot, beat: dict, step_idx_snapshot: int, beat_idx_snapshot: int):
+    """Через N секунд молчания на вопросе шлёт подсказку, если пользователь
+    всё ещё на этом же вопросе (не ответил и не запросил её вручную раньше —
+    повторная отправка того же текста не страшна)."""
+    delay = beat.get("hint_delay_sec", 90)
+    hint_text = beat.get("hint")
     if not hint_text:
         return
     try:
         await asyncio.sleep(delay)
         state = await storage.get_state(user_id)
-        if state and state["step_idx"] == step_idx_snapshot and not state["finished"]:
+        if (
+            state
+            and not state["finished"]
+            and state["step_idx"] == step_idx_snapshot
+            and state["clue_idx"] == beat_idx_snapshot
+        ):
             await bot.send_message(chat_id, hint_text)
     except asyncio.CancelledError:
         pass
 
 
-async def send_step(user_id: int, chat_id: int, bot: Bot, state: dict):
-    """Отправляет пользователю сообщение, соответствующее его текущему шагу."""
+async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
+    """Главный цикл движка. Проходит вперёд по «битам» текущей локации,
+    молча отправляя информационные сообщения (kind == "text"), и
+    останавливается на первом «биту», который требует действия
+    пользователя: физического прихода на точку (arrival), готовности
+    продолжить (wait_ready) или ответа на вопрос (question). На финальной
+    паузе (pause_then_text) ждёт нужное время прямо здесь, не блокируя
+    остальных пользователей (await asyncio.sleep внутри async-хендлера
+    блокирует только эту конкретную задачу)."""
     cancel_hint_task(user_id)
 
-    if state["step_idx"] >= len(STEPS):
-        return
+    while True:
+        if state["step_idx"] >= len(STEPS):
+            state["finished"] = True
+            await storage.save_state(state)
+            await storage.mark_code_completed(state.get("code"))
+            return
 
-    step = STEPS[state["step_idx"]]
-    step_type = step["type"]
+        beats = STEPS[state["step_idx"]]["beats"]
 
-    if step_type == "single":
-        text = f"{step['header']}\n\n{step['text']}\n\n{step['question']}"
-        await bot.send_message(chat_id, text)
-        if step.get("hint"):
-            task = asyncio.create_task(
-                schedule_hint(user_id, chat_id, bot, step, state["step_idx"])
-            )
-            _hint_tasks[user_id] = task
+        if state["clue_idx"] >= len(beats):
+            state["step_idx"] += 1
+            state["clue_idx"] = 0
+            await storage.save_state(state)
+            continue
 
-    elif step_type == "multi":
-        clue = step["clues"][state["clue_idx"]]
-        parts = []
-        if state["clue_idx"] == 0:
-            parts.append(step["header"])
-            if step.get("intro_text"):
-                parts.append(step["intro_text"])
-        if clue.get("text"):
-            parts.append(clue["text"])
-        parts.append(clue["question"])
-        await bot.send_message(chat_id, "\n\n".join(parts))
+        beat = beats[state["clue_idx"]]
+        kind = beat["kind"]
 
-    elif step_type == "rest":
-        text = f"{step['header']}\n\n{step['text']}"
-        await bot.send_message(chat_id, text, reply_markup=rest_keyboard())
+        if kind == "text":
+            await bot.send_message(chat_id, beat["text"])
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            continue
 
-    elif step_type == "rest_question":
-        text = f"{step['header']}\n\n{step['text']}\n\n{step['question']}"
-        await bot.send_message(chat_id, text, reply_markup=rest_question_keyboard())
+        if kind == "pause_then_text":
+            await asyncio.sleep(beat.get("delay_sec", 30))
+            await bot.send_message(chat_id, beat["text"])
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            continue
 
-    elif step_type == "final":
-        if state["clue_idx"] == 0:
-            text = f"{step['header']}\n\n{step['text']}\n\n{step['question']}"
-            await bot.send_message(chat_id, text)
-        else:
-            text = (
-                f"{step['word_prompt']}\n\nСобрано: {progress_word(state['letters'])}"
-            )
-            await bot.send_message(chat_id, text)
+        if kind == "arrival":
+            await bot.send_message(chat_id, beat["text"], reply_markup=arrival_keyboard())
+            await storage.save_state(state)
+            return
 
+        if kind == "wait_ready":
+            await bot.send_message(chat_id, beat["text"], reply_markup=wait_ready_keyboard(beat.get("button_label")))
+            await storage.save_state(state)
+            return
 
-async def advance_after_letter(state: dict, step: dict):
-    """Добавляет букву (если есть) и переводит состояние на следующий шаг."""
-    if step.get("letter"):
-        state["letters"] = state["letters"] + [step["letter"]]
-    state["step_idx"] += 1
-    state["clue_idx"] = 0
+        if kind == "question":
+            await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard())
+            await storage.save_state(state)
+            if beat.get("hint") and beat.get("hint_delay_sec"):
+                task = asyncio.create_task(
+                    schedule_hint(user_id, chat_id, bot, beat, state["step_idx"], state["clue_idx"])
+                )
+                _hint_tasks[user_id] = task
+            return
 
-
-async def finish_current_step_and_continue(user_id: int, chat_id: int, bot: Bot, state: dict, step: dict):
-    await advance_after_letter(state, step)
-    await storage.save_state(state)
-    if state["step_idx"] < len(STEPS):
-        await send_step(user_id, chat_id, bot, state)
-    else:
-        state["finished"] = True
+        # неизвестный тип бита — на всякий случай не зависаем молча
+        state["clue_idx"] += 1
         await storage.save_state(state)
 
 
@@ -555,9 +575,7 @@ async def cmd_progress(message: Message):
         await message.answer("Расследование уже завершено! 🏆")
         return
     step = STEPS[min(state["step_idx"], len(STEPS) - 1)]
-    await message.answer(
-        f"Текущая точка: {step['header']}\nСобрано букв: {progress_word(state['letters'])}"
-    )
+    await message.answer(f"Текущая точка: {step['header']}")
 
 
 # ---------------------------------------------------------------------------
@@ -568,7 +586,12 @@ async def cmd_progress(message: Message):
 async def cb_resume_continue(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     state = await storage.get_state(callback.from_user.id)
-    await send_step(callback.from_user.id, callback.message.chat.id, bot, state)
+    if state is None:
+        return
+    if state["step_idx"] < 0:
+        await begin_quest_intro(bot, callback.message.chat.id)
+        return
+    await advance_quest(callback.from_user.id, callback.message.chat.id, bot, state)
 
 
 @router.callback_query(F.data == "resume_restart")
@@ -577,44 +600,94 @@ async def cb_resume_restart(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     cancel_hint_task(user_id)
     await storage.reset_state(user_id)
-    await callback.message.answer(CONTENT["intro"]["text"])
-    await callback.message.answer(CONTENT["mode_prompt"], reply_markup=mode_keyboard())
+    await begin_quest_intro(bot, callback.message.chat.id)
 
 
-@router.callback_query(F.data.in_({"mode_audio", "mode_text"}))
-async def cb_mode_selected(callback: CallbackQuery, bot: Bot):
+@router.callback_query(F.data == "quest_start")
+async def cb_quest_start(callback: CallbackQuery, bot: Bot):
+    """Игрок нажал «Начать квест» на вступительном экране."""
     await callback.answer()
     user_id = callback.from_user.id
-    mode = "audio" if callback.data == "mode_audio" else "text"
     state = await storage.get_state(user_id)
     if state is None:
         state = storage.new_state(user_id)
-    state["mode"] = mode
     state["step_idx"] = 0
     state["clue_idx"] = 0
-    state["letters"] = []
     state["finished"] = False
     await storage.save_state(state)
 
-    await callback.message.answer(CONTENT["mode_confirm"][mode])
-    await send_step(user_id, callback.message.chat.id, bot, state)
+    await callback.message.answer(CONTENT["r_intro"])
+    await advance_quest(user_id, callback.message.chat.id, bot, state)
 
 
-@router.callback_query(F.data == "rest_next")
-async def cb_rest_next(callback: CallbackQuery, bot: Bot):
+@router.callback_query(F.data == "arrived")
+async def cb_arrived(callback: CallbackQuery, bot: Bot):
+    """Игрок физически дошёл до точки и нажал «📍 Я пришёл»."""
     await callback.answer()
     user_id = callback.from_user.id
     state = await storage.get_state(user_id)
-    if state is None or state["step_idx"] < 0 or state["step_idx"] >= len(STEPS):
+    if state is None or state["finished"]:
         return
-    step = STEPS[state["step_idx"]]
-    if step["type"] not in ("rest", "rest_question"):
+    beat = current_beat(state)
+    if beat is None or beat["kind"] != "arrival":
         return
+    cancel_hint_task(user_id)
+    state["clue_idx"] += 1
+    await storage.save_state(state)
+    await advance_quest(user_id, callback.message.chat.id, bot, state)
 
-    shadow = step.get("shadow_after")
-    await finish_current_step_and_continue(user_id, callback.message.chat.id, bot, state, step)
-    if shadow:
-        await callback.message.answer(shadow)
+
+@router.callback_query(F.data == "wait_ready")
+async def cb_wait_ready(callback: CallbackQuery, bot: Bot):
+    """Игрок нажал кнопку «Готов» на точке отдыха (без ответа на вопрос)."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    state = await storage.get_state(user_id)
+    if state is None or state["finished"]:
+        return
+    beat = current_beat(state)
+    if beat is None or beat["kind"] != "wait_ready":
+        return
+    cancel_hint_task(user_id)
+    state["clue_idx"] += 1
+    await storage.save_state(state)
+    await advance_quest(user_id, callback.message.chat.id, bot, state)
+
+
+@router.callback_query(F.data == "think")
+async def cb_think(callback: CallbackQuery, bot: Bot):
+    """«🧠 Подумать самому» — подбадривающая фраза, кнопка подсказки
+    остаётся доступной, ответ по-прежнему ждём текстом."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    state = await storage.get_state(user_id)
+    if state is None or state["finished"]:
+        return
+    beat = current_beat(state)
+    if beat is None or beat["kind"] != "question":
+        return
+    bank = CONTENT["think_replies"]
+    idx = state.get("think_count", 0) % len(bank)
+    state["think_count"] = state.get("think_count", 0) + 1
+    await storage.save_state(state)
+    await callback.message.answer(bank[idx])
+
+
+@router.callback_query(F.data == "hint")
+async def cb_hint(callback: CallbackQuery, bot: Bot):
+    """«💡 Нужна подсказка» — присылает подсказку по запросу сразу, не
+    дожидаясь автоматической отложенной отправки."""
+    await callback.answer()
+    user_id = callback.from_user.id
+    state = await storage.get_state(user_id)
+    if state is None or state["finished"]:
+        return
+    beat = current_beat(state)
+    if beat is None or beat["kind"] != "question":
+        return
+    hint_text = beat.get("hint")
+    if hint_text:
+        await callback.message.answer(hint_text)
 
 
 @router.callback_query(F.data.startswith("confirm_pay:"))
@@ -720,127 +793,22 @@ async def handle_answer(message: Message, bot: Bot):
         )
         return
 
-    if state["step_idx"] >= len(STEPS):
+    beat = current_beat(state)
+    if beat is None or beat["kind"] != "question":
+        # человек написал что-то текстом там, где сейчас ждём не ответ, а
+        # нажатие кнопки (arrival/wait_ready) — просто мягко напоминаем.
         return
 
-    step = STEPS[state["step_idx"]]
-    step_type = step["type"]
-
-    # --- одиночный вопрос ---
-    if step_type == "single":
-        if check_answer(user_text, step):
-            cancel_hint_task(user_id)
-            if step.get("correct_reply"):
-                await message.answer(step["correct_reply"])
-            if step.get("dossier"):
-                await message.answer(step["dossier"])
-            letter = step.get("letter")
-            shadow = step.get("shadow_after")
-
-            await advance_after_letter(state, step)
-            await storage.save_state(state)
-
-            if letter:
-                await message.answer(
-                    f"🔑 Буква №{len(state['letters'])}: {letter}\n"
-                    f"Собрано: {progress_word(state['letters'])}"
-                )
-            if shadow:
-                await message.answer(shadow)
-
-            if state["step_idx"] < len(STEPS):
-                await send_step(user_id, chat_id, bot, state)
-            else:
-                state["finished"] = True
-                await storage.save_state(state)
-        else:
-            await message.answer(CONTENT["generic_wrong"])
-        return
-
-    # --- составной вопрос (несколько улик на одной точке) ---
-    if step_type == "multi":
-        clue = step["clues"][state["clue_idx"]]
-        if check_answer(user_text, clue):
-            if clue.get("correct_reply"):
-                await message.answer(clue["correct_reply"])
-
-            if state["clue_idx"] + 1 < len(step["clues"]):
-                state["clue_idx"] += 1
-                await storage.save_state(state)
-                await send_step(user_id, chat_id, bot, state)
-            else:
-                # все улики собраны
-                if step.get("combined_text"):
-                    await message.answer(step["combined_text"])
-                if step.get("dossier"):
-                    await message.answer(step["dossier"])
-                letter = step.get("letter")
-                shadow = step.get("shadow_after")
-
-                await advance_after_letter(state, step)
-                await storage.save_state(state)
-
-                if letter:
-                    await message.answer(
-                        f"🔑 Буква №{len(state['letters'])}: {letter}\n"
-                        f"Собрано: {progress_word(state['letters'])}"
-                    )
-                if shadow:
-                    await message.answer(shadow)
-
-                if state["step_idx"] < len(STEPS):
-                    await send_step(user_id, chat_id, bot, state)
-                else:
-                    state["finished"] = True
-                    await storage.save_state(state)
-        else:
-            await message.answer(CONTENT["generic_wrong"])
-        return
-
-    # --- точка отдыха с лёгким вопросом (без буквы) ---
-    if step_type == "rest_question":
-        if check_answer(user_text, step):
-            if step.get("correct_reply"):
-                await message.answer(step["correct_reply"])
-            if step.get("dossier"):
-                await message.answer(step["dossier"])
-            await message.answer(
-                "Можешь идти дальше.", reply_markup=rest_keyboard()
-            )
-        else:
-            await message.answer(
-                CONTENT["generic_wrong_rest"], reply_markup=rest_question_keyboard()
-            )
-        return
-
-    # --- финальный этап ---
-    if step_type == "final":
-        if state["clue_idx"] == 0:
-            if check_answer(user_text, step):
-                if step.get("correct_reply"):
-                    await message.answer(step["correct_reply"])
-                letter = step.get("letter")
-                state["letters"] = state["letters"] + [letter] if letter else state["letters"]
-                state["clue_idx"] = 1
-                await storage.save_state(state)
-                await message.answer(
-                    f"🔑 Буква №{len(state['letters'])}: {letter}\n"
-                    f"Собрано: {progress_word(state['letters'])}"
-                )
-                await send_step(user_id, chat_id, bot, state)
-            else:
-                await message.answer(CONTENT["generic_wrong"])
-        else:
-            if normalize(user_text) == normalize(TARGET_WORD):
-                await message.answer(step["final_success"])
-                state["finished"] = True
-                await storage.save_state(state)
-                await storage.mark_code_completed(state.get("code"))
-            else:
-                await message.answer(
-                    f"{step['final_wrong']}\nСобрано: {progress_word(state['letters'])}"
-                )
-        return
+    if check_answer(user_text, beat):
+        cancel_hint_task(user_id)
+        if beat.get("correct_reply"):
+            await message.answer(beat["correct_reply"])
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, chat_id, bot, state)
+    else:
+        await message.answer(CONTENT["generic_wrong"])
+    return
 
 
 # ---------------------------------------------------------------------------
