@@ -331,6 +331,29 @@ async def schedule_hint(user_id: int, chat_id: int, bot: Bot, beat: dict, step_i
         pass
 
 
+async def schedule_arrival_followup(user_id: int, chat_id: int, bot: Bot, followup: dict, step_idx_snapshot: int, beat_idx_snapshot: int):
+    """Через N секунд, если пользователь всё ещё не нажал «Я пришёл» на этой
+    же точке (например, R. отправил его не туда), шлёт сообщение-поправку.
+    Отменяется автоматически, как только человек реально дошёл и нажал
+    кнопку — см. cancel_hint_task() в cb_arrived."""
+    delay = followup.get("delay_sec", 300)
+    text = followup.get("text")
+    if not text:
+        return
+    try:
+        await asyncio.sleep(delay)
+        state = await storage.get_state(user_id)
+        if (
+            state
+            and not state["finished"]
+            and state["step_idx"] == step_idx_snapshot
+            and state["clue_idx"] == beat_idx_snapshot
+        ):
+            await bot.send_message(chat_id, text)
+    except asyncio.CancelledError:
+        pass
+
+
 async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
     """Главный цикл движка. Проходит вперёд по «битам» текущей локации,
     молча отправляя информационные сообщения (kind == "text"), и
@@ -376,6 +399,12 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         if kind == "arrival":
             await bot.send_message(chat_id, beat["text"], reply_markup=arrival_keyboard())
             await storage.save_state(state)
+            followup = beat.get("delayed_followup")
+            if followup:
+                task = asyncio.create_task(
+                    schedule_arrival_followup(user_id, chat_id, bot, followup, state["step_idx"], state["clue_idx"])
+                )
+                _hint_tasks[user_id] = task
             return
 
         if kind == "wait_ready":
