@@ -72,6 +72,11 @@ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 # Задачи с отложенными подсказками: {user_id: asyncio.Task}
 _hint_tasks: dict[int, asyncio.Task] = {}
+# пользователи, которые нажали «Оставить отзыв» и следующим текстовым
+# сообщением пришлют сам отзыв (не персистентно — в худшем случае, если
+# бот перезапустится между нажатием и текстом, отзыв просто не долетит
+# до админов, это не влияет на прохождение квеста)
+_awaiting_review: set[int] = set()
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +118,15 @@ def start_quest_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=CONTENT["intro"]["start_button"], callback_data="quest_start")]
+        ]
+    )
+
+
+def outro_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📸 Оставить отзыв", callback_data="leave_review")],
+            [InlineKeyboardButton(text="✅ Завершить квест", callback_data="finish_quest")],
         ]
     )
 
@@ -412,6 +426,13 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             await storage.save_state(state)
             return
 
+        if kind == "outro":
+            await bot.send_message(chat_id, beat["text"], reply_markup=outro_keyboard())
+            state["finished"] = True
+            await storage.save_state(state)
+            await storage.mark_code_completed(state.get("code"))
+            return
+
         if kind == "question":
             await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard())
             await storage.save_state(state)
@@ -644,8 +665,6 @@ async def cb_quest_start(callback: CallbackQuery, bot: Bot):
     state["clue_idx"] = 0
     state["finished"] = False
     await storage.save_state(state)
-
-    await callback.message.answer(CONTENT["r_intro"])
     await advance_quest(user_id, callback.message.chat.id, bot, state)
 
 
@@ -702,7 +721,17 @@ async def cb_think(callback: CallbackQuery, bot: Bot):
     await callback.message.answer(bank[idx])
 
 
-@router.callback_query(F.data == "hint")
+@router.callback_query(F.data == "leave_review")
+async def cb_leave_review(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    _awaiting_review.add(callback.from_user.id)
+    await callback.message.answer("Жду твой отзыв следующим сообщением 🙌 Пиши как есть — что понравилось, а что стоит доработать.")
+
+
+@router.callback_query(F.data == "finish_quest")
+async def cb_finish_quest(callback: CallbackQuery, bot: Bot):
+    await callback.answer()
+    await callback.message.answer("Спасибо, что прошёл(а) этот маршрут! До новых прогулок 🌿")
 async def cb_hint(callback: CallbackQuery, bot: Bot):
     """«💡 Нужна подсказка» — присылает подсказку по запросу сразу, не
     дожидаясь автоматической отложенной отправки."""
@@ -817,9 +846,20 @@ async def handle_answer(message: Message, bot: Bot):
         return
 
     if state["finished"]:
-        await message.answer(
-            "Расследование уже завершено! Если хочешь пройти снова — напиши /reset."
-        )
+        if user_id in _awaiting_review:
+            _awaiting_review.discard(user_id)
+            label = buyer_label(message)
+            header = f"⭐ Новый отзыв о квесте\nОт: {label}"
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin_id, f"{header}\n\n{user_text}")
+                except Exception:
+                    logger.exception(f"Не удалось переслать отзыв админу {admin_id}")
+            await message.answer("Спасибо огромное за отзыв! Мне правда важно твоё мнение 💛")
+        else:
+            await message.answer(
+                "Расследование уже завершено! Если хочешь пройти снова — напиши /reset."
+            )
         return
 
     beat = current_beat(state)

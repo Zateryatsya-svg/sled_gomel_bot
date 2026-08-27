@@ -36,23 +36,24 @@ def extract_number(text: str):
 def check_answer(user_text: str, clue: dict) -> bool:
     """Проверяет ответ пользователя против описания вопроса (clue/step).
 
-    clue может содержать либо "answers" (список текстовых альтернатив),
-    либо "numeric" (словарь {"target": int, "tolerance": int}).
+    clue может содержать "numeric" (словарь {"target": int, "tolerance": int})
+    и/или "answers" (список текстовых альтернатив) — если заданы оба, ответ
+    считается верным, если подходит хотя бы один из них (например, вопрос
+    допускает ответ и точным годом, и словом "век").
     """
     numeric_spec = clue.get("numeric")
     if numeric_spec:
         value = extract_number(user_text)
-        if value is None:
-            return False
-        target = numeric_spec["target"]
-        tolerance = numeric_spec.get("tolerance", 0)
-        return abs(value - target) <= tolerance
+        if value is not None:
+            target = numeric_spec["target"]
+            tolerance = numeric_spec.get("tolerance", 0)
+            if abs(value - target) <= tolerance:
+                return True
 
     accepted = clue.get("answers", [])
     normalized_user = normalize(user_text)
-    if not normalized_user:
-        return False
-    for ans in accepted:
-        if normalize(ans) == normalized_user:
-            return True
+    if normalized_user:
+        for ans in accepted:
+            if normalize(ans) == normalized_user:
+                return True
     return False
