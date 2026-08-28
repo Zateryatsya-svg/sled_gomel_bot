@@ -10,6 +10,7 @@ content.json — редактировать его можно без измен�
 Токен бота берётся из переменной окружения BOT_TOKEN (см. .env.example).
 """
 import asyncio
+import html
 import io
 import json
 import logging
@@ -87,6 +88,22 @@ def cancel_hint_task(user_id: int):
     task = _hint_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
+
+
+TONYA_SPEAKER_DELAY_SEC = 2.5
+
+
+async def send_narrative(bot: Bot, chat_id: int, text: str, speaker: str | None = None, reply_markup=None):
+    """Отправляет повествовательный текст. Если это реплика Тони
+    (speaker == "tonya") — сначала небольшая пауза (не приходит слитно сразу
+    за предыдущим сообщением от лица маршрута), затем текст курсивом с
+    отдельной иконкой — визуально отличается от основного текста квеста.
+    HTML разметка (parse_mode) для бота уже включена глобально по умолчанию."""
+    if speaker == "tonya":
+        await asyncio.sleep(TONYA_SPEAKER_DELAY_SEC)
+        await bot.send_message(chat_id, f"🌿 <i>{html.escape(text)}</i>", reply_markup=reply_markup)
+    else:
+        await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
 
 def arrival_keyboard() -> InlineKeyboardMarkup:
@@ -398,20 +415,20 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         kind = beat["kind"]
 
         if kind == "text":
-            await bot.send_message(chat_id, beat["text"])
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
             state["clue_idx"] += 1
             await storage.save_state(state)
             continue
 
         if kind == "pause_then_text":
             await asyncio.sleep(beat.get("delay_sec", 30))
-            await bot.send_message(chat_id, beat["text"])
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
             state["clue_idx"] += 1
             await storage.save_state(state)
             continue
 
         if kind == "arrival":
-            await bot.send_message(chat_id, beat["text"], reply_markup=arrival_keyboard())
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=arrival_keyboard())
             await storage.save_state(state)
             followup = beat.get("delayed_followup")
             if followup:
@@ -422,12 +439,12 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             return
 
         if kind == "wait_ready":
-            await bot.send_message(chat_id, beat["text"], reply_markup=wait_ready_keyboard(beat.get("button_label")))
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=wait_ready_keyboard(beat.get("button_label")))
             await storage.save_state(state)
             return
 
         if kind == "outro":
-            await bot.send_message(chat_id, beat["text"], reply_markup=outro_keyboard())
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=outro_keyboard())
             state["finished"] = True
             await storage.save_state(state)
             await storage.mark_code_completed(state.get("code"))
@@ -732,6 +749,7 @@ async def cb_leave_review(callback: CallbackQuery, bot: Bot):
 async def cb_finish_quest(callback: CallbackQuery, bot: Bot):
     await callback.answer()
     await callback.message.answer("Спасибо, что прошёл(а) этот маршрут! До новых прогулок 🌿")
+@router.callback_query(F.data == "hint")
 async def cb_hint(callback: CallbackQuery, bot: Bot):
     """«💡 Нужна подсказка» — присылает подсказку по запросу сразу, не
     дожидаясь автоматической отложенной отправки."""
