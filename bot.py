@@ -17,6 +17,7 @@ import logging
 import os
 import re
 import secrets
+import time
 
 import qrcode
 from aiogram import Bot, Dispatcher, F, Router
@@ -104,6 +105,41 @@ async def send_narrative(bot: Bot, chat_id: int, text: str, speaker: str | None 
         await bot.send_message(chat_id, f"🌿 <i>{html.escape(text)}</i>", reply_markup=reply_markup)
     else:
         await bot.send_message(chat_id, text, reply_markup=reply_markup)
+
+
+async def safe_answer(callback: CallbackQuery):
+    """Обёртка над callback.answer(). Если человек нажал кнопку под старым
+    сообщением после долгого простоя (бот перезапускался, телефон был вне
+    сети и т.п.), Telegram иногда отвечает ошибкой "query is too old" на
+    сам answer() — и БЕЗ этой обёртки это исключение обрывало весь хендлер
+    кнопки до того, как он успевал сделать что-либо полезное, то есть кнопка
+    выглядела как будто "не работает". Сама механика проверки ответа
+    (check_answer и т.д.) от этого никак не зависит — эта функция только
+    убирает мигающие часики на кнопке и не должна ронять остальную логику."""
+    try:
+        await callback.answer()
+    except Exception:
+        logger.warning("callback.answer() не сработал (вероятно, устаревший callback) — продолжаю без него")
+
+
+QUEST_EXPIRY_SECONDS = 24 * 60 * 60  # сутки
+
+
+async def get_active_state(user_id: int) -> tuple[dict | None, bool]:
+    """Возвращает (state, expired). Если квест был начат, но не завершён,
+    и с последнего действия прошло больше суток — прогресс автоматически
+    сбрасывается (код доступа сохраняется), а expired=True говорит
+    вызывающему коду, что нужно сообщить об этом человеку."""
+    state = await storage.get_state(user_id)
+    if state is None:
+        return None, False
+    if not state["finished"] and state["step_idx"] >= 0:
+        last_active = state.get("updated_at") or 0
+        if time.time() - last_active > QUEST_EXPIRY_SECONDS:
+            cancel_hint_task(user_id)
+            state = await storage.reset_state(user_id)
+            return state, True
+    return state, False
 
 
 def arrival_keyboard() -> InlineKeyboardMarkup:
@@ -651,9 +687,15 @@ async def cmd_progress(message: Message):
 
 @router.callback_query(F.data == "resume_continue")
 async def cb_resume_continue(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
-    state = await storage.get_state(callback.from_user.id)
+    await safe_answer(callback)
+    state, expired = await get_active_state(callback.from_user.id)
     if state is None:
+        return
+    if expired:
+        await callback.message.answer(
+            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
+        )
+        await begin_quest_intro(bot, callback.message.chat.id)
         return
     if state["step_idx"] < 0:
         await begin_quest_intro(bot, callback.message.chat.id)
@@ -663,7 +705,7 @@ async def cb_resume_continue(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "resume_restart")
 async def cb_resume_restart(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
+    await safe_answer(callback)
     user_id = callback.from_user.id
     cancel_hint_task(user_id)
     await storage.reset_state(user_id)
@@ -673,7 +715,7 @@ async def cb_resume_restart(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "quest_start")
 async def cb_quest_start(callback: CallbackQuery, bot: Bot):
     """Игрок нажал «Начать квест» на вступительном экране."""
-    await callback.answer()
+    await safe_answer(callback)
     user_id = callback.from_user.id
     state = await storage.get_state(user_id)
     if state is None:
@@ -688,10 +730,16 @@ async def cb_quest_start(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "arrived")
 async def cb_arrived(callback: CallbackQuery, bot: Bot):
     """Игрок физически дошёл до точки и нажал «📍 Я пришёл»."""
-    await callback.answer()
+    await safe_answer(callback)
     user_id = callback.from_user.id
-    state = await storage.get_state(user_id)
+    state, expired = await get_active_state(user_id)
     if state is None or state["finished"]:
+        return
+    if expired:
+        await callback.message.answer(
+            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
+        )
+        await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
     if beat is None or beat["kind"] != "arrival":
@@ -705,10 +753,16 @@ async def cb_arrived(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "wait_ready")
 async def cb_wait_ready(callback: CallbackQuery, bot: Bot):
     """Игрок нажал кнопку «Готов» на точке отдыха (без ответа на вопрос)."""
-    await callback.answer()
+    await safe_answer(callback)
     user_id = callback.from_user.id
-    state = await storage.get_state(user_id)
+    state, expired = await get_active_state(user_id)
     if state is None or state["finished"]:
+        return
+    if expired:
+        await callback.message.answer(
+            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
+        )
+        await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
     if beat is None or beat["kind"] != "wait_ready":
@@ -723,10 +777,16 @@ async def cb_wait_ready(callback: CallbackQuery, bot: Bot):
 async def cb_think(callback: CallbackQuery, bot: Bot):
     """«🧠 Подумать самому» — подбадривающая фраза, кнопка подсказки
     остаётся доступной, ответ по-прежнему ждём текстом."""
-    await callback.answer()
+    await safe_answer(callback)
     user_id = callback.from_user.id
-    state = await storage.get_state(user_id)
+    state, expired = await get_active_state(user_id)
     if state is None or state["finished"]:
+        return
+    if expired:
+        await callback.message.answer(
+            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
+        )
+        await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
     if beat is None or beat["kind"] != "question":
@@ -740,23 +800,31 @@ async def cb_think(callback: CallbackQuery, bot: Bot):
 
 @router.callback_query(F.data == "leave_review")
 async def cb_leave_review(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
+    await safe_answer(callback)
     _awaiting_review.add(callback.from_user.id)
     await callback.message.answer("Жду твой отзыв следующим сообщением 🙌 Пиши как есть — что понравилось, а что стоит доработать.")
 
 
 @router.callback_query(F.data == "finish_quest")
 async def cb_finish_quest(callback: CallbackQuery, bot: Bot):
-    await callback.answer()
+    await safe_answer(callback)
     await callback.message.answer("Спасибо, что прошёл(а) этот маршрут! До новых прогулок 🌿")
+
+
 @router.callback_query(F.data == "hint")
 async def cb_hint(callback: CallbackQuery, bot: Bot):
     """«💡 Нужна подсказка» — присылает подсказку по запросу сразу, не
     дожидаясь автоматической отложенной отправки."""
-    await callback.answer()
+    await safe_answer(callback)
     user_id = callback.from_user.id
-    state = await storage.get_state(user_id)
+    state, expired = await get_active_state(user_id)
     if state is None or state["finished"]:
+        return
+    if expired:
+        await callback.message.answer(
+            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
+        )
+        await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
     if beat is None or beat["kind"] != "question":
@@ -843,7 +911,7 @@ async def handle_photo(message: Message, bot: Bot):
 async def handle_answer(message: Message, bot: Bot):
     user_id = message.from_user.id
     chat_id = message.chat.id
-    state = await storage.get_state(user_id)
+    state, expired = await get_active_state(user_id)
     user_text = message.text
 
     if state is None or not state.get("code"):
@@ -857,6 +925,13 @@ async def handle_answer(message: Message, bot: Bot):
             await try_activate_code(message, user_text)
         else:
             await forward_payment_claim(message, bot)
+        return
+
+    if expired:
+        await message.answer(
+            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
+        )
+        await begin_quest_intro(message.bot, message.chat.id)
         return
 
     if state["step_idx"] < 0:

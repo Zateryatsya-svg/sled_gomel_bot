@@ -55,6 +55,12 @@ async def init_db():
             await db.execute("ALTER TABLE user_state ADD COLUMN think_count INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
+        # мягкая миграция: время последней активности — нужна, чтобы
+        # автоматически сбрасывать зависший больше суток прогресс
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -80,15 +86,17 @@ async def get_state(user_id: int) -> dict | None:
                 "finished": bool(row["finished"]),
                 "code": row["code"],
                 "think_count": row["think_count"] if "think_count" in row.keys() else 0,
+                "updated_at": row["updated_at"] if "updated_at" in row.keys() else 0,
             }
 
 
 async def save_state(state: dict):
+    now = int(time.time())
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code, think_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code, think_count, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 step_idx = excluded.step_idx,
                 clue_idx = excluded.clue_idx,
@@ -96,7 +104,8 @@ async def save_state(state: dict):
                 mode = excluded.mode,
                 finished = excluded.finished,
                 code = excluded.code,
-                think_count = excluded.think_count
+                think_count = excluded.think_count,
+                updated_at = excluded.updated_at
             """,
             (
                 state["user_id"],
@@ -107,6 +116,7 @@ async def save_state(state: dict):
                 int(state["finished"]),
                 state.get("code"),
                 state.get("think_count", 0),
+                now,
             ),
         )
         await db.commit()
