@@ -145,12 +145,13 @@ async def get_active_state(user_id: int) -> tuple[dict | None, bool]:
     return state, False
 
 
-def arrival_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=CONTENT["buttons"]["arrived"], callback_data="arrived")]
-        ]
-    )
+def arrival_keyboard(with_hint: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if with_hint:
+        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")])
+        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")])
+    rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["arrived"], callback_data="arrived")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def wait_ready_keyboard(label: str | None = None) -> InlineKeyboardMarkup:
@@ -467,12 +468,17 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             continue
 
         if kind == "arrival":
-            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=arrival_keyboard())
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint"))))
             await storage.save_state(state)
             followup = beat.get("delayed_followup")
             if followup:
                 task = asyncio.create_task(
                     schedule_arrival_followup(user_id, chat_id, bot, followup, state["step_idx"], state["clue_idx"])
+                )
+                _hint_tasks[user_id] = task
+            elif beat.get("hint") and beat.get("hint_delay_sec"):
+                task = asyncio.create_task(
+                    schedule_hint(user_id, chat_id, bot, beat, state["step_idx"], state["clue_idx"])
                 )
                 _hint_tasks[user_id] = task
             return
@@ -780,7 +786,7 @@ async def cb_think(callback: CallbackQuery, bot: Bot):
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
-    if beat is None or beat["kind"] != "question":
+    if beat is None or beat["kind"] not in ("question", "arrival"):
         return
     bank = CONTENT["think_replies"]
     idx = state.get("think_count", 0) % len(bank)
@@ -815,7 +821,7 @@ async def cb_hint(callback: CallbackQuery, bot: Bot):
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
-    if beat is None or beat["kind"] != "question":
+    if beat is None or beat["kind"] not in ("question", "arrival"):
         return
     hint_text = beat.get("hint")
     if hint_text:
