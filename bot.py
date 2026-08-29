@@ -123,6 +123,9 @@ async def safe_answer(callback: CallbackQuery):
 
 
 QUEST_EXPIRY_SECONDS = 24 * 60 * 60  # сутки
+REMINDER_AFTER_SECONDS = 6 * 60 * 60  # напомнить, если человек не появлялся 6+ часов
+REMINDER_SWEEP_INTERVAL_SEC = 15 * 60  # как часто проверять базу на "застрявших"
+SUPPORT_EMAIL = "sled.gomel@outlook.com"
 
 
 async def get_active_state(user_id: int) -> tuple[dict | None, bool]:
@@ -692,9 +695,6 @@ async def cb_resume_continue(callback: CallbackQuery, bot: Bot):
     if state is None:
         return
     if expired:
-        await callback.message.answer(
-            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
-        )
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     if state["step_idx"] < 0:
@@ -736,9 +736,6 @@ async def cb_arrived(callback: CallbackQuery, bot: Bot):
     if state is None or state["finished"]:
         return
     if expired:
-        await callback.message.answer(
-            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
-        )
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
@@ -759,9 +756,6 @@ async def cb_wait_ready(callback: CallbackQuery, bot: Bot):
     if state is None or state["finished"]:
         return
     if expired:
-        await callback.message.answer(
-            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
-        )
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
@@ -783,9 +777,6 @@ async def cb_think(callback: CallbackQuery, bot: Bot):
     if state is None or state["finished"]:
         return
     if expired:
-        await callback.message.answer(
-            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
-        )
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
@@ -821,9 +812,6 @@ async def cb_hint(callback: CallbackQuery, bot: Bot):
     if state is None or state["finished"]:
         return
     if expired:
-        await callback.message.answer(
-            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
-        )
         await begin_quest_intro(bot, callback.message.chat.id)
         return
     beat = current_beat(state)
@@ -928,9 +916,6 @@ async def handle_answer(message: Message, bot: Bot):
         return
 
     if expired:
-        await message.answer(
-            "Прошли сутки без активности, поэтому прогресс расследования сбросился. Начнём с начала?"
-        )
         await begin_quest_intro(message.bot, message.chat.id)
         return
 
@@ -974,6 +959,36 @@ async def handle_answer(message: Message, bot: Bot):
 
 
 # ---------------------------------------------------------------------------
+# Фоновое напоминание: если человек начал квест и пропал на 6+ часов (но ещё
+# не прошли сутки, после которых прогресс сбрасывается сам), один раз мягко
+# напоминаем, что на прохождение даётся 24 часа с начала — без объяснения,
+# что именно сейчас произошло со стороны бота, просто сам факт лимита.
+# Работает через периодический обход базы (а не таймер на каждую кнопку),
+# поэтому переживает перезапуск бота.
+# ---------------------------------------------------------------------------
+
+REMINDER_TEXT = (
+    "⏳ Напоминаем: квест активен 24 часа с момента начала — у тебя ещё есть время его пройти!\n\n"
+    f"Если возникнут вопросы — пиши на {SUPPORT_EMAIL}"
+)
+
+
+async def reminder_sweep_loop(bot: Bot):
+    while True:
+        try:
+            user_ids = await storage.get_users_needing_reminder(REMINDER_AFTER_SECONDS, QUEST_EXPIRY_SECONDS)
+            for user_id in user_ids:
+                try:
+                    await bot.send_message(user_id, REMINDER_TEXT)
+                except Exception:
+                    logger.warning(f"Не удалось отправить напоминание {user_id} (мог заблокировать бота)")
+                await storage.mark_reminder_sent(user_id)
+        except Exception:
+            logger.exception("Ошибка в фоновом обходе напоминаний")
+        await asyncio.sleep(REMINDER_SWEEP_INTERVAL_SEC)
+
+
+# ---------------------------------------------------------------------------
 # Точка входа
 # ---------------------------------------------------------------------------
 
@@ -986,6 +1001,7 @@ async def main():
     logger.info(f"Бот запущен как @{BOT_USERNAME}, начинаю polling...")
     dp = Dispatcher()
     dp.include_router(router)
+    asyncio.create_task(reminder_sweep_loop(bot))
     await dp.start_polling(bot)
 
 

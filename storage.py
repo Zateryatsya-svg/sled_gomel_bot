@@ -61,6 +61,12 @@ async def init_db():
             await db.execute("ALTER TABLE user_state ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
+        # мягкая миграция: флаг "уже отправили напоминание про 24 часа",
+        # чтобы не слать его повторно при каждой фоновой проверке
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -95,8 +101,8 @@ async def save_state(state: dict):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code, think_count, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code, think_count, updated_at, reminder_sent)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
             ON CONFLICT(user_id) DO UPDATE SET
                 step_idx = excluded.step_idx,
                 clue_idx = excluded.clue_idx,
@@ -105,7 +111,8 @@ async def save_state(state: dict):
                 finished = excluded.finished,
                 code = excluded.code,
                 think_count = excluded.think_count,
-                updated_at = excluded.updated_at
+                updated_at = excluded.updated_at,
+                reminder_sent = 0
             """,
             (
                 state["user_id"],
@@ -118,6 +125,35 @@ async def save_state(state: dict):
                 state.get("think_count", 0),
                 now,
             ),
+        )
+        await db.commit()
+
+
+async def get_users_needing_reminder(min_idle_sec: int, max_idle_sec: int) -> list[int]:
+    """Возвращает user_id тех, кто начал квест, не закончил его, не
+    появлялся от min_idle_sec до max_idle_sec, и кому ещё не отправляли
+    напоминание с последнего действия."""
+    now = int(time.time())
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """
+            SELECT user_id FROM user_state
+            WHERE finished = 0
+              AND step_idx >= 0
+              AND reminder_sent = 0
+              AND (? - updated_at) >= ?
+              AND (? - updated_at) < ?
+            """,
+            (now, min_idle_sec, now, max_idle_sec),
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return [row[0] for row in rows]
+
+
+async def mark_reminder_sent(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE user_state SET reminder_sent = 1 WHERE user_id = ?", (user_id,)
         )
         await db.commit()
 
