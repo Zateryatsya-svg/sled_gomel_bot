@@ -103,7 +103,7 @@ async def send_narrative(bot: Bot, chat_id: int, text: str, speaker: str | None 
     HTML разметка (parse_mode) для бота уже включена глобально по умолчанию."""
     if speaker == "tonya":
         await asyncio.sleep(TONYA_SPEAKER_DELAY_SEC)
-        await bot.send_message(chat_id, f"<b>Тоня</b>\n<i>{html.escape(text)}</i>", reply_markup=reply_markup)
+        await bot.send_message(chat_id, f"<b>Тоня</b>\n<i>{text}</i>", reply_markup=reply_markup)
     else:
         await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
