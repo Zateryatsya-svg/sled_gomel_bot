@@ -91,18 +91,19 @@ def cancel_hint_task(user_id: int):
         task.cancel()
 
 
-TONYA_SPEAKER_DELAY_SEC = 2.5
+TONYA_SPEAKER_DELAY_SEC = int(os.getenv("TONYA_SPEAKER_DELAY_SEC", "90"))  # ~полторы минуты в проде
 
 
 async def send_narrative(bot: Bot, chat_id: int, text: str, speaker: str | None = None, reply_markup=None):
     """Отправляет повествовательный текст. Если это реплика Тони
-    (speaker == "tonya") — сначала небольшая пауза (не приходит слитно сразу
-    за предыдущим сообщением от лица маршрута), затем текст курсивом с
-    отдельной иконкой — визуально отличается от основного текста квеста.
+    (speaker == "tonya") — сначала пауза подольше (не приходит слитно сразу
+    за предыдущим сообщением, а как будто спустя пару минут, пока человек
+    ищет или думает), затем текст с явной подписью "Тоня" курсивом — так
+    видно, что это отдельный голос, а не автоматическая подсказка бота.
     HTML разметка (parse_mode) для бота уже включена глобально по умолчанию."""
     if speaker == "tonya":
         await asyncio.sleep(TONYA_SPEAKER_DELAY_SEC)
-        await bot.send_message(chat_id, f"🌿 <i>{html.escape(text)}</i>", reply_markup=reply_markup)
+        await bot.send_message(chat_id, f"<b>Тоня</b>\n<i>{html.escape(text)}</i>", reply_markup=reply_markup)
     else:
         await bot.send_message(chat_id, text, reply_markup=reply_markup)
 
