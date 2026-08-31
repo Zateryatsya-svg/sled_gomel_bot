@@ -31,9 +31,11 @@ from aiogram.types import (
     FSInputFile,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
+    InputMediaPhoto,
 )
 from dotenv import load_dotenv
 
+import certificate
 import storage
 from answer_utils import check_answer
 
@@ -74,6 +76,13 @@ CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
 
 # Задачи с отложенными подсказками: {user_id: asyncio.Task}
 _hint_tasks: dict[int, asyncio.Task] = {}
+# Задачи с "долго думаешь" напоминаниями (отдельный таймер от подсказки —
+# оба могут тикать параллельно на одном и том же вопросе)
+_longthink_tasks: dict[int, asyncio.Task] = {}
+# Момент показа текущего вопроса — для детекта "быстрого ответа"
+# (не персистентно: в худшем случае, если бот перезапустится ровно между
+# показом вопроса и ответом, бонус за скорость просто не сработает один раз)
+_question_shown_at: dict[int, float] = {}
 # пользователи, которые нажали «Оставить отзыв» и следующим текстовым
 # сообщением пришлют сам отзыв (не персистентно — в худшем случае, если
 # бот перезапустится между нажатием и текстом, отзыв просто не долетит
@@ -86,9 +95,15 @@ _awaiting_review: set[int] = set()
 # ---------------------------------------------------------------------------
 
 def cancel_hint_task(user_id: int):
+    """Отменяет ОБА возможных таймера, тикающих на текущем вопросе —
+    отложенную подсказку и напоминание "долго думаешь". Вызывается всегда,
+    когда пользователь реально продвинулся дальше (ответил, нажал кнопку)."""
     task = _hint_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
+    lt_task = _longthink_tasks.pop(user_id, None)
+    if lt_task and not lt_task.done():
+        lt_task.cancel()
 
 
 TONYA_SPEAKER_DELAY_SEC = int(os.getenv("TONYA_SPEAKER_DELAY_SEC", "90"))  # ~полторы минуты в проде
@@ -127,6 +142,9 @@ QUEST_EXPIRY_SECONDS = 24 * 60 * 60  # сутки
 REMINDER_AFTER_SECONDS = 6 * 60 * 60  # напомнить, если человек не появлялся 6+ часов
 REMINDER_SWEEP_INTERVAL_SEC = 15 * 60  # как часто проверять базу на "застрявших"
 SUPPORT_EMAIL = "sled.gomel@outlook.com"
+
+LONG_THINK_AFTER_SEC = int(os.getenv("LONG_THINK_AFTER_SEC", str(4 * 60)))  # 4 минуты
+FAST_ANSWER_UNDER_SEC = int(os.getenv("FAST_ANSWER_UNDER_SEC", "60"))  # меньше минуты
 
 
 async def get_active_state(user_id: int) -> tuple[dict | None, bool]:
@@ -426,15 +444,41 @@ async def schedule_arrival_followup(user_id: int, chat_id: int, bot: Bot, follow
         pass
 
 
+async def schedule_long_think(user_id: int, chat_id: int, bot: Bot, step_idx_snapshot: int, beat_idx_snapshot: int):
+    """Через LONG_THINK_AFTER_SEC молчания на вопросе шлёт подбадривающую
+    фразу из банка long_think_replies (по кругу, на весь квест). Отдельный
+    таймер от подсказки — оба тикают параллельно на одном вопросе."""
+    bank = CONTENT.get("long_think_replies") or []
+    if not bank:
+        return
+    try:
+        await asyncio.sleep(LONG_THINK_AFTER_SEC)
+        state = await storage.get_state(user_id)
+        if (
+            state
+            and not state["finished"]
+            and state["step_idx"] == step_idx_snapshot
+            and state["clue_idx"] == beat_idx_snapshot
+        ):
+            idx = state.get("long_think_count", 0) % len(bank)
+            item = bank[idx]
+            state["long_think_count"] = state.get("long_think_count", 0) + 1
+            await storage.save_state(state)
+            await send_narrative(bot, chat_id, item["text"], item.get("speaker"))
+    except asyncio.CancelledError:
+        pass
+
+
 async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
     """Главный цикл движка. Проходит вперёд по «битам» текущей локации,
     молча отправляя информационные сообщения (kind == "text"), и
     останавливается на первом «биту», который требует действия
     пользователя: физического прихода на точку (arrival), готовности
-    продолжить (wait_ready) или ответа на вопрос (question). На финальной
-    паузе (pause_then_text) ждёт нужное время прямо здесь, не блокируя
-    остальных пользователей (await asyncio.sleep внутри async-хендлера
-    блокирует только эту конкретную задачу)."""
+    продолжить (wait_ready), ответа на вопрос (question) или ввода имени
+    (collect_name). Любой бит может нести "delay_before_sec" — движок ждёт
+    это время перед его отправкой (await asyncio.sleep внутри
+    async-хендлера блокирует только эту конкретную задачу, остальные
+    пользователи не ждут)."""
     cancel_hint_task(user_id)
 
     while True:
@@ -455,6 +499,9 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         beat = beats[state["clue_idx"]]
         kind = beat["kind"]
 
+        if beat.get("delay_before_sec"):
+            await asyncio.sleep(beat["delay_before_sec"])
+
         if kind == "text":
             await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
             state["clue_idx"] += 1
@@ -464,6 +511,30 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         if kind == "pause_then_text":
             await asyncio.sleep(beat.get("delay_sec", 30))
             await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            continue
+
+        if kind == "photo":
+            images = beat.get("images") or []
+            if images:
+                media = [
+                    InputMediaPhoto(media=FSInputFile(p), caption=beat.get("caption", "") if i == 0 else None)
+                    for i, p in enumerate(images)
+                ]
+                await bot.send_media_group(chat_id, media=media)
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            continue
+
+        if kind == "certificate":
+            player_name = state.get("player_name") or "Детектив парка Паскевичей"
+            png_bytes = certificate.generate_certificate_png(player_name)
+            await bot.send_photo(
+                chat_id,
+                BufferedInputFile(png_bytes, filename="certificate.png"),
+                caption=beat.get("caption", ""),
+            )
             state["clue_idx"] += 1
             await storage.save_state(state)
             continue
@@ -496,14 +567,25 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             await storage.mark_code_completed(state.get("code"))
             return
 
+        if kind == "collect_name":
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
+            await storage.save_state(state)
+            return
+
         if kind == "question":
             await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard())
             await storage.save_state(state)
+            _question_shown_at[user_id] = time.time()
             if beat.get("hint") and beat.get("hint_delay_sec"):
                 task = asyncio.create_task(
                     schedule_hint(user_id, chat_id, bot, beat, state["step_idx"], state["clue_idx"])
                 )
                 _hint_tasks[user_id] = task
+            if CONTENT.get("long_think_replies"):
+                lt_task = asyncio.create_task(
+                    schedule_long_think(user_id, chat_id, bot, state["step_idx"], state["clue_idx"])
+                )
+                _longthink_tasks[user_id] = lt_task
             return
 
         # неизвестный тип бита — на всякий случай не зависаем молча
@@ -948,20 +1030,49 @@ async def handle_answer(message: Message, bot: Bot):
         return
 
     beat = current_beat(state)
-    if beat is None or beat["kind"] != "question":
+    if beat is None:
+        return
+
+    if beat["kind"] == "collect_name":
+        cancel_hint_task(user_id)
+        state["player_name"] = user_text.strip()
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, chat_id, bot, state)
+        return
+
+    if beat["kind"] != "question":
         # человек написал что-то текстом там, где сейчас ждём не ответ, а
         # нажатие кнопки (arrival/wait_ready) — просто мягко напоминаем.
         return
 
     if check_answer(user_text, beat):
         cancel_hint_task(user_id)
+
+        shown_at = _question_shown_at.pop(user_id, None)
+        if shown_at is not None and (time.time() - shown_at) < FAST_ANSWER_UNDER_SEC:
+            bank = CONTENT.get("fast_answer_replies") or []
+            if bank:
+                idx = state.get("fast_answer_count", 0) % len(bank)
+                item = bank[idx]
+                state["fast_answer_count"] = state.get("fast_answer_count", 0) + 1
+                await send_narrative(bot, chat_id, item["text"], item.get("speaker"))
+
         if beat.get("correct_reply"):
             await message.answer(beat["correct_reply"])
         state["clue_idx"] += 1
         await storage.save_state(state)
         await advance_quest(user_id, chat_id, bot, state)
     else:
-        await message.answer(CONTENT["generic_wrong"])
+        bank = CONTENT.get("wrong_answer_replies") or []
+        if bank:
+            idx = state.get("wrong_answer_count", 0) % len(bank)
+            item = bank[idx]
+            state["wrong_answer_count"] = state.get("wrong_answer_count", 0) + 1
+            await storage.save_state(state)
+            await send_narrative(bot, chat_id, item["text"], item.get("speaker"))
+        else:
+            await message.answer(CONTENT["generic_wrong"])
     return
 
 

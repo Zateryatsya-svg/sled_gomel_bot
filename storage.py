@@ -67,6 +67,25 @@ async def init_db():
             await db.execute("ALTER TABLE user_state ADD COLUMN reminder_sent INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
+        # мягкая миграция: имя и фамилия игрока (для именного сертификата)
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN player_name TEXT")
+        except Exception:
+            pass
+        # мягкая миграция: счётчики для ротации адаптивных банков фраз —
+        # "долго думает", "быстрый ответ", "неправильный ответ"
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN long_think_count INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN fast_answer_count INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN wrong_answer_count INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -93,6 +112,10 @@ async def get_state(user_id: int) -> dict | None:
                 "code": row["code"],
                 "think_count": row["think_count"] if "think_count" in row.keys() else 0,
                 "updated_at": row["updated_at"] if "updated_at" in row.keys() else 0,
+                "player_name": row["player_name"] if "player_name" in row.keys() else None,
+                "long_think_count": row["long_think_count"] if "long_think_count" in row.keys() else 0,
+                "fast_answer_count": row["fast_answer_count"] if "fast_answer_count" in row.keys() else 0,
+                "wrong_answer_count": row["wrong_answer_count"] if "wrong_answer_count" in row.keys() else 0,
             }
 
 
@@ -101,8 +124,11 @@ async def save_state(state: dict):
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
             """
-            INSERT INTO user_state (user_id, step_idx, clue_idx, letters, mode, finished, code, think_count, updated_at, reminder_sent)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+            INSERT INTO user_state (
+                user_id, step_idx, clue_idx, letters, mode, finished, code, think_count,
+                updated_at, reminder_sent, player_name, long_think_count, fast_answer_count, wrong_answer_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 step_idx = excluded.step_idx,
                 clue_idx = excluded.clue_idx,
@@ -112,7 +138,11 @@ async def save_state(state: dict):
                 code = excluded.code,
                 think_count = excluded.think_count,
                 updated_at = excluded.updated_at,
-                reminder_sent = 0
+                reminder_sent = 0,
+                player_name = excluded.player_name,
+                long_think_count = excluded.long_think_count,
+                fast_answer_count = excluded.fast_answer_count,
+                wrong_answer_count = excluded.wrong_answer_count
             """,
             (
                 state["user_id"],
@@ -124,6 +154,10 @@ async def save_state(state: dict):
                 state.get("code"),
                 state.get("think_count", 0),
                 now,
+                state.get("player_name"),
+                state.get("long_think_count", 0),
+                state.get("fast_answer_count", 0),
+                state.get("wrong_answer_count", 0),
             ),
         )
         await db.commit()
@@ -161,9 +195,11 @@ async def mark_reminder_sent(user_id: int):
 async def reset_state(user_id: int):
     """Сбрасывает прогресс, но НЕ трогает привязку кода — код сбрасывать
     отдельно нужно через revoke_code, иначе человек просто начнёт заново
-    свой же квест по своему же коду."""
+    свой же квест по своему же коду. Имя игрока тоже сохраняем — не нужно
+    заново его спрашивать после автосброса по неактивности."""
     existing = await get_state(user_id)
     keep_code = existing["code"] if existing else None
+    keep_name = existing["player_name"] if existing else None
     fresh = {
         "user_id": user_id,
         "step_idx": -1,
@@ -173,6 +209,10 @@ async def reset_state(user_id: int):
         "finished": False,
         "code": keep_code,
         "think_count": 0,
+        "player_name": keep_name,
+        "long_think_count": 0,
+        "fast_answer_count": 0,
+        "wrong_answer_count": 0,
     }
     await save_state(fresh)
     return fresh
@@ -188,6 +228,10 @@ def new_state(user_id: int) -> dict:
         "finished": False,
         "code": None,
         "think_count": 0,
+        "player_name": None,
+        "long_think_count": 0,
+        "fast_answer_count": 0,
+        "wrong_answer_count": 0,
     }
 
 
