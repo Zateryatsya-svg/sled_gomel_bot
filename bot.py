@@ -110,14 +110,19 @@ TONYA_SPEAKER_DELAY_SEC = int(os.getenv("TONYA_SPEAKER_DELAY_SEC", "90"))  # ~п
 
 
 async def send_narrative(bot: Bot, chat_id: int, text: str, speaker: str | None = None, reply_markup=None):
-    """Отправляет повествовательный текст. Если это реплика Тони
-    (speaker == "tonya") — сначала пауза подольше (не приходит слитно сразу
-    за предыдущим сообщением, а как будто спустя пару минут, пока человек
-    ищет или думает), затем текст с явной подписью "Тоня" курсивом — так
-    видно, что это отдельный голос, а не автоматическая подсказка бота.
+    """Отправляет повествовательный текст.
+    speaker == "tonya" — реплика Тони "между делом": сначала пауза подольше
+    (как будто спустя пару минут, пока человек ищет или думает), затем
+    текст с явной подписью "Тоня" курсивом.
+    speaker == "tonya_instant" — та же визуальная подпись Тони, но БЕЗ
+    задержки: для важных сообщений (например, знакомство в самом начале),
+    где долгая пауза выглядела бы как зависание бота, а не как атмосферная
+    деталь.
     HTML разметка (parse_mode) для бота уже включена глобально по умолчанию."""
     if speaker == "tonya":
         await asyncio.sleep(TONYA_SPEAKER_DELAY_SEC)
+        await bot.send_message(chat_id, f"<b>Тоня</b>\n<i>{text}</i>", reply_markup=reply_markup)
+    elif speaker == "tonya_instant":
         await bot.send_message(chat_id, f"<b>Тоня</b>\n<i>{text}</i>", reply_markup=reply_markup)
     else:
         await bot.send_message(chat_id, text, reply_markup=reply_markup)
