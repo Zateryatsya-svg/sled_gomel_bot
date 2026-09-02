@@ -79,6 +79,10 @@ _hint_tasks: dict[int, asyncio.Task] = {}
 # Задачи с "долго думаешь" напоминаниями (отдельный таймер от подсказки —
 # оба могут тикать параллельно на одном и том же вопросе)
 _longthink_tasks: dict[int, asyncio.Task] = {}
+# Задачи с репликами Тони "между делом" во время загадки — появляются
+# ПОСЛЕ того, как вопрос уже показан и кнопки "Подумаю сам"/"Подсказка"
+# уже доступны, не раньше
+_aside_tasks: dict[int, asyncio.Task] = {}
 # Момент показа текущего вопроса — для детекта "быстрого ответа"
 # (не персистентно: в худшем случае, если бот перезапустится ровно между
 # показом вопроса и ответом, бонус за скорость просто не сработает один раз)
@@ -95,18 +99,22 @@ _awaiting_review: set[int] = set()
 # ---------------------------------------------------------------------------
 
 def cancel_hint_task(user_id: int):
-    """Отменяет ОБА возможных таймера, тикающих на текущем вопросе —
-    отложенную подсказку и напоминание "долго думаешь". Вызывается всегда,
-    когда пользователь реально продвинулся дальше (ответил, нажал кнопку)."""
+    """Отменяет ВСЕ возможные таймеры, тикающие на текущем вопросе —
+    отложенную подсказку, напоминание "долго думаешь" и реплику-ремарку
+    Тони. Вызывается всегда, когда пользователь реально продвинулся дальше
+    (ответил, нажал кнопку)."""
     task = _hint_tasks.pop(user_id, None)
     if task and not task.done():
         task.cancel()
     lt_task = _longthink_tasks.pop(user_id, None)
     if lt_task and not lt_task.done():
         lt_task.cancel()
+    aside_task = _aside_tasks.pop(user_id, None)
+    if aside_task and not aside_task.done():
+        aside_task.cancel()
 
 
-TONYA_SPEAKER_DELAY_SEC = int(os.getenv("TONYA_SPEAKER_DELAY_SEC", "90"))  # ~полторы минуты в проде
+TONYA_SPEAKER_DELAY_SEC = int(os.getenv("TONYA_SPEAKER_DELAY_SEC", "30"))  # 30 секунд в проде
 
 
 async def send_narrative(bot: Bot, chat_id: int, text: str, speaker: str | None = None, reply_markup=None):
@@ -255,9 +263,16 @@ def normalize_code(raw: str) -> str:
 
 
 async def begin_quest_intro(bot: Bot, chat_id: int):
-    """Показывает вступительный текст с кнопкой «Начать квест». Само
-    расследование (step_idx=0) стартует только по нажатию этой кнопки —
+    """Если имя ещё не собрано — сначала спрашивает имя и фамилию (следующее
+    текстовое сообщение человека перехватит handle_answer и сохранит его,
+    затем снова вызовет эту функцию). Вступительный текст с кнопкой
+    «Начать квест» показывается только после того, как имя получено.
+    Само расследование (step_idx=0) стартует по нажатию этой кнопки —
     см. cb_quest_start."""
+    state = await storage.get_state(chat_id)
+    if state and not state.get("player_name"):
+        await bot.send_message(chat_id, CONTENT["name_prompt"])
+        return
     await bot.send_message(chat_id, CONTENT["intro"]["text"], reply_markup=start_quest_keyboard())
 
 
@@ -474,6 +489,31 @@ async def schedule_long_think(user_id: int, chat_id: int, bot: Bot, step_idx_sna
         pass
 
 
+async def schedule_question_aside(user_id: int, chat_id: int, bot: Bot, aside: dict, step_idx_snapshot: int, beat_idx_snapshot: int):
+    """Реплика Тони "между делом", которая должна появиться уже ПОСЛЕ
+    того, как вопрос показан и кнопки "Подумаю сам"/"Подсказка" доступны —
+    через aside["delay_sec"] секунд, если человек всё ещё на этом вопросе.
+    Использует "tonya_instant"-стиль (подпись + курсив без дополнительной
+    внутренней задержки в send_narrative) — сама задержка уже отработана
+    здесь, дублировать её не нужно."""
+    text = aside.get("text")
+    if not text:
+        return
+    delay = aside.get("delay_sec", 30)
+    try:
+        await asyncio.sleep(delay)
+        state = await storage.get_state(user_id)
+        if (
+            state
+            and not state["finished"]
+            and state["step_idx"] == step_idx_snapshot
+            and state["clue_idx"] == beat_idx_snapshot
+        ):
+            await send_narrative(bot, chat_id, text, "tonya_instant")
+    except asyncio.CancelledError:
+        pass
+
+
 async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
     """Главный цикл движка. Проходит вперёд по «битам» текущей локации,
     молча отправляя информационные сообщения (kind == "text"), и
@@ -591,6 +631,11 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
                     schedule_long_think(user_id, chat_id, bot, state["step_idx"], state["clue_idx"])
                 )
                 _longthink_tasks[user_id] = lt_task
+            if beat.get("tonya_aside"):
+                aside_task = asyncio.create_task(
+                    schedule_question_aside(user_id, chat_id, bot, beat["tonya_aside"], state["step_idx"], state["clue_idx"])
+                )
+                _aside_tasks[user_id] = aside_task
             return
 
         # неизвестный тип бита — на всякий случай не зависаем молча
@@ -1014,6 +1059,11 @@ async def handle_answer(message: Message, bot: Bot):
         return
 
     if state["step_idx"] < 0:
+        if not state.get("player_name"):
+            state["player_name"] = user_text.strip()
+            await storage.save_state(state)
+            await begin_quest_intro(message.bot, message.chat.id)
+            return
         await begin_quest_intro(message.bot, message.chat.id)
         return
 
