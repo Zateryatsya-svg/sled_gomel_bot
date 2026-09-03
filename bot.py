@@ -194,6 +194,15 @@ def wait_ready_keyboard(label: str | None = None) -> InlineKeyboardMarkup:
     )
 
 
+def photo_request_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📸 Отправить фото", callback_data="photo_req_info")],
+            [InlineKeyboardButton(text="➡️ Пропустить", callback_data="photo_req_skip")],
+        ]
+    )
+
+
 def question_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -419,28 +428,6 @@ def current_beat(state: dict) -> dict | None:
     return beats[state["clue_idx"]]
 
 
-async def schedule_hint(user_id: int, chat_id: int, bot: Bot, beat: dict, step_idx_snapshot: int, beat_idx_snapshot: int):
-    """Через N секунд молчания на вопросе шлёт подсказку, если пользователь
-    всё ещё на этом же вопросе (не ответил и не запросил её вручную раньше —
-    повторная отправка того же текста не страшна)."""
-    delay = beat.get("hint_delay_sec", 90)
-    hint_text = beat.get("hint")
-    if not hint_text:
-        return
-    try:
-        await asyncio.sleep(delay)
-        state = await storage.get_state(user_id)
-        if (
-            state
-            and not state["finished"]
-            and state["step_idx"] == step_idx_snapshot
-            and state["clue_idx"] == beat_idx_snapshot
-        ):
-            await bot.send_message(chat_id, hint_text)
-    except asyncio.CancelledError:
-        pass
-
-
 async def schedule_arrival_followup(user_id: int, chat_id: int, bot: Bot, followup: dict, step_idx_snapshot: int, beat_idx_snapshot: int):
     """Через N секунд, если пользователь всё ещё не нажал «Я пришёл» на этой
     же точке (например, R. отправил его не туда), шлёт сообщение-поправку.
@@ -500,6 +487,10 @@ async def schedule_question_aside(user_id: int, chat_id: int, bot: Bot, aside: d
     if not text:
         return
     delay = aside.get("delay_sec", 30)
+    # По умолчанию реплика "между делом" подписана как Тоня, но конкретная
+    # реплика может явно попросить отправить её от лица бота — тогда в
+    # content.json у неё стоит "speaker": null.
+    speaker = aside["speaker"] if "speaker" in aside else "tonya_instant"
     try:
         await asyncio.sleep(delay)
         state = await storage.get_state(user_id)
@@ -509,7 +500,7 @@ async def schedule_question_aside(user_id: int, chat_id: int, bot: Bot, aside: d
             and state["step_idx"] == step_idx_snapshot
             and state["clue_idx"] == beat_idx_snapshot
         ):
-            await send_narrative(bot, chat_id, text, "tonya_instant")
+            await send_narrative(bot, chat_id, text, speaker)
     except asyncio.CancelledError:
         pass
 
@@ -593,11 +584,9 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
                     schedule_arrival_followup(user_id, chat_id, bot, followup, state["step_idx"], state["clue_idx"])
                 )
                 _hint_tasks[user_id] = task
-            elif beat.get("hint") and beat.get("hint_delay_sec"):
-                task = asyncio.create_task(
-                    schedule_hint(user_id, chat_id, bot, beat, state["step_idx"], state["clue_idx"])
-                )
-                _hint_tasks[user_id] = task
+            # Подсказка больше не приходит автоматически по таймеру — только
+            # по нажатию кнопки "💡 Подсказка" (см. cb_hint), даже если
+            # человек долго не отвечает.
             return
 
         if kind == "wait_ready":
@@ -617,15 +606,21 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             await storage.save_state(state)
             return
 
+        if kind == "photo_request":
+            # Тоня предлагает сфоткаться — необязательный шаг. Ждём либо
+            # фото сообщением (см. handle_photo), либо нажатие "Пропустить"
+            # (см. cb_photo_req_skip). Оба пути ведут дальше по квесту.
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=photo_request_keyboard())
+            await storage.save_state(state)
+            return
+
         if kind == "question":
             await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard())
             await storage.save_state(state)
             _question_shown_at[user_id] = time.time()
-            if beat.get("hint") and beat.get("hint_delay_sec"):
-                task = asyncio.create_task(
-                    schedule_hint(user_id, chat_id, bot, beat, state["step_idx"], state["clue_idx"])
-                )
-                _hint_tasks[user_id] = task
+            # Подсказка больше не приходит автоматически по таймеру — только
+            # по нажатию кнопки "💡 Подсказка" (см. cb_hint), даже если
+            # человек долго не отвечает.
             if CONTENT.get("long_think_replies"):
                 lt_task = asyncio.create_task(
                     schedule_long_think(user_id, chat_id, bot, state["step_idx"], state["clue_idx"])
@@ -961,6 +956,37 @@ async def cb_hint(callback: CallbackQuery, bot: Bot):
         await callback.message.answer(hint_text)
 
 
+@router.callback_query(F.data == "photo_req_skip")
+async def cb_photo_req_skip(callback: CallbackQuery, bot: Bot):
+    """Игрок нажал «➡️ Пропустить» вместо того, чтобы прислать селфи."""
+    await safe_answer(callback)
+    user_id = callback.from_user.id
+    state, expired = await get_active_state(user_id)
+    if state is None or state["finished"]:
+        return
+    if expired:
+        await begin_quest_intro(bot, callback.message.chat.id)
+        return
+    beat = current_beat(state)
+    if beat is None or beat.get("kind") != "photo_request":
+        return
+    cancel_hint_task(user_id)
+    reply = beat.get("skip_reply")
+    if reply:
+        await callback.message.answer(reply)
+    state["clue_idx"] += 1
+    await storage.save_state(state)
+    await advance_quest(user_id, callback.message.chat.id, bot, state)
+
+
+@router.callback_query(F.data == "photo_req_info")
+async def cb_photo_req_info(callback: CallbackQuery, bot: Bot):
+    """Кнопка-подсказка «📸 Отправить фото» — сама отправка происходит
+    обычным сообщением с фото, кнопка просто напоминает, как это сделать."""
+    await safe_answer(callback)
+    await callback.message.answer("Просто прикрепи фото прямо сюда, в чат 📎")
+
+
 @router.callback_query(F.data.startswith("confirm_pay:"))
 async def cb_confirm_pay(callback: CallbackQuery, bot: Bot):
     if callback.from_user.id not in ADMIN_IDS:
@@ -1024,10 +1050,36 @@ async def cb_confirm_pay(callback: CallbackQuery, bot: Bot):
 @router.message(F.photo)
 async def handle_photo(message: Message, bot: Bot):
     user_id = message.from_user.id
+    chat_id = message.chat.id
     state = await storage.get_state(user_id)
     if state is None or not state.get("code"):
         await forward_payment_claim(message, bot)
-    # если код уже есть — фото вне контекста квеста, просто игнорируем
+        return
+
+    beat = current_beat(state)
+    if beat is not None and beat.get("kind") == "photo_request":
+        # Игрок прислал селфи с памятником — пересылаем организаторам
+        # (от лица Тони "прилетит прямо ко мне") и идём дальше по квесту.
+        cancel_hint_task(user_id)
+        if ADMIN_IDS:
+            label = buyer_label(message)
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot.send_photo(
+                        admin_id,
+                        message.photo[-1].file_id,
+                        caption=f"📸 Селфи от игрока\nОт: {label}",
+                    )
+                except Exception as e:
+                    logger.warning(f"Не удалось переслать селфи админу {admin_id}: {e}")
+        reply = beat.get("photo_reply")
+        if reply:
+            await message.answer(reply)
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, chat_id, bot, state)
+        return
+    # если код уже есть и мы не ждём фото — вне контекста квеста, просто игнорируем
 
 
 # ---------------------------------------------------------------------------
