@@ -36,6 +36,7 @@ from aiogram.types import (
 from dotenv import load_dotenv
 
 import certificate
+import collage
 import storage
 from answer_utils import check_answer
 
@@ -194,13 +195,11 @@ def wait_ready_keyboard(label: str | None = None) -> InlineKeyboardMarkup:
     )
 
 
-def photo_request_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📸 Отправить фото", callback_data="photo_req_info")],
-            [InlineKeyboardButton(text="➡️ Пропустить", callback_data="photo_req_skip")],
-        ]
-    )
+def photo_request_keyboard(show_skip: bool = True) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="📸 Отправить фото", callback_data="photo_req_info")]]
+    if show_skip:
+        rows.append([InlineKeyboardButton(text="➡️ Пропустить", callback_data="photo_req_skip")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def question_keyboard() -> InlineKeyboardMarkup:
@@ -282,7 +281,9 @@ async def begin_quest_intro(bot: Bot, chat_id: int):
     if state and not state.get("player_name"):
         await bot.send_message(chat_id, CONTENT["name_prompt"])
         return
-    await bot.send_message(chat_id, CONTENT["intro"]["text"], reply_markup=start_quest_keyboard())
+    player_name = (state or {}).get("player_name") or ""
+    intro_text = CONTENT["intro"]["text"].replace("{name}", player_name)
+    await bot.send_message(chat_id, intro_text, reply_markup=start_quest_keyboard())
 
 
 PAYMENT_QR_PATH = "assets/payment_qr.png"
@@ -387,6 +388,7 @@ async def try_activate_code(message: Message, raw_code: str):
         state = storage.new_state(user_id)
         state["code"] = code
         await storage.save_state(state)
+        await storage.clear_quest_photos(user_id)
         await message.answer(
             "✅ Код принят! Доступ открыт и привязан к твоему аккаунту — "
             "передать его кому-то ещё уже не получится."
@@ -607,12 +609,52 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             return
 
         if kind == "photo_request":
-            # Тоня предлагает сфоткаться — необязательный шаг. Ждём либо
-            # фото сообщением (см. handle_photo), либо нажатие "Пропустить"
-            # (см. cb_photo_req_skip). Оба пути ведут дальше по квесту.
-            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=photo_request_keyboard())
+            # Тоня предлагает сфоткаться. По умолчанию шаг необязательный —
+            # ждём либо фото сообщением (см. handle_photo), либо нажатие
+            # "Пропустить" (см. cb_photo_req_skip). Если у бита выставлено
+            # "skip_button": false — кнопки "Пропустить" не будет и шаг
+            # становится обязательным (см. tower/photo_slot="tower").
+            show_skip = beat.get("skip_button", True)
+            await send_narrative(
+                bot, chat_id, beat["text"], beat.get("speaker"),
+                reply_markup=photo_request_keyboard(show_skip=show_skip),
+            )
             await storage.save_state(state)
             return
+
+        if kind == "album":
+            # Собираем и отправляем именной сертификат + памятный коллаж
+            # из фото, которые игрок присылал по ходу квеста (см.
+            # photo_slot у соответствующих beat'ов выше и storage.py).
+            player_name = state.get("player_name") or "Детектив парка Паскевичей"
+            png_bytes = certificate.generate_certificate_png(player_name)
+            await bot.send_photo(
+                chat_id,
+                BufferedInputFile(png_bytes, filename="certificate.png"),
+                caption=beat.get("caption", ""),
+            )
+            try:
+                stored_photos = await storage.get_quest_photos(user_id)
+                photo_bytes_by_slot = {}
+                for slot, file_id in stored_photos.items():
+                    try:
+                        file = await bot.get_file(file_id)
+                        buf = await bot.download_file(file.file_path)
+                        photo_bytes_by_slot[slot] = buf.read()
+                    except Exception as e:
+                        logger.warning(f"Не удалось скачать фото для коллажа (слот {slot}): {e}")
+                if photo_bytes_by_slot:
+                    collage_png = collage.generate_collage_png(photo_bytes_by_slot)
+                    await bot.send_photo(
+                        chat_id,
+                        BufferedInputFile(collage_png, filename="collage.png"),
+                        caption="✨ И твой памятный коллаж этой прогулки!",
+                    )
+            except Exception:
+                logger.exception("Не удалось собрать памятный коллаж")
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            continue
 
         if kind == "question":
             await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard())
@@ -1075,6 +1117,12 @@ async def handle_photo(message: Message, bot: Bot):
         reply = beat.get("photo_reply")
         if reply:
             await message.answer(reply)
+        slot = beat.get("photo_slot")
+        if slot:
+            try:
+                await storage.save_quest_photo(user_id, slot, message.photo[-1].file_id)
+            except Exception as e:
+                logger.warning(f"Не удалось сохранить фото для коллажа (слот {slot}): {e}")
         state["clue_idx"] += 1
         await storage.save_state(state)
         await advance_quest(user_id, chat_id, bot, state)

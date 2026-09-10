@@ -39,11 +39,21 @@ CREATE TABLE IF NOT EXISTS access_codes (
 );
 """
 
+_CREATE_QUEST_PHOTOS = """
+CREATE TABLE IF NOT EXISTS quest_photos (
+    user_id INTEGER NOT NULL,
+    slot TEXT NOT NULL,
+    file_id TEXT NOT NULL,
+    PRIMARY KEY (user_id, slot)
+);
+"""
+
 
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(_CREATE_USER_STATE)
         await db.execute(_CREATE_ACCESS_CODES)
+        await db.execute(_CREATE_QUEST_PHOTOS)
         # мягкая миграция для уже существующих баз без колонки code
         try:
             await db.execute("ALTER TABLE user_state ADD COLUMN code TEXT")
@@ -215,6 +225,7 @@ async def reset_state(user_id: int):
         "wrong_answer_count": 0,
     }
     await save_state(fresh)
+    await clear_quest_photos(user_id)
     return fresh
 
 
@@ -233,6 +244,39 @@ def new_state(user_id: int) -> dict:
         "fast_answer_count": 0,
         "wrong_answer_count": 0,
     }
+
+
+# ---------------------------------------------------------------------------
+# Фото для памятного коллажа (собираются по ходу квеста, см. photo_slot
+# у соответствующих beat'ов в content.json; итоговый коллаж собирается в
+# collage.py на финальном шаге).
+# ---------------------------------------------------------------------------
+
+async def save_quest_photo(user_id: int, slot: str, file_id: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO quest_photos (user_id, slot, file_id) VALUES (?, ?, ?)
+            ON CONFLICT(user_id, slot) DO UPDATE SET file_id = excluded.file_id
+            """,
+            (user_id, slot, file_id),
+        )
+        await db.commit()
+
+
+async def get_quest_photos(user_id: int) -> dict:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT slot, file_id FROM quest_photos WHERE user_id = ?", (user_id,)
+        ) as cursor:
+            rows = await cursor.fetchall()
+            return {row[0]: row[1] for row in rows}
+
+
+async def clear_quest_photos(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM quest_photos WHERE user_id = ?", (user_id,))
+        await db.commit()
 
 
 # ---------------------------------------------------------------------------
