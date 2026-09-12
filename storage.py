@@ -10,10 +10,16 @@
                    становится невозможно.
 """
 import json
+import os
 import time
 import aiosqlite
 
-DB_PATH = "quest_progress.db"
+# На Amvera обязательно нужно хранить SQLite в постоянном хранилище
+# /data (иначе база пересоздаётся с нуля при каждом передеплое) — см.
+# переменную окружения DB_PATH в настройках приложения на Amvera
+# (Переменные → DB_PATH = /data/quest_progress.db). Локально и на любом
+# другом хостинге, где DB_PATH не задан, используется файл рядом с кодом.
+DB_PATH = os.getenv("DB_PATH", "quest_progress.db")
 
 _CREATE_USER_STATE = """
 CREATE TABLE IF NOT EXISTS user_state (
