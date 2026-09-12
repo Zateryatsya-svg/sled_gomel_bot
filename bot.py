@@ -779,7 +779,7 @@ async def cmd_gencode(message: Message, command: CommandObject, bot: Bot):
 async def cmd_amiadmin(message: Message):
     """Диагностическая команда — доступна всем, показывает, видит ли бот
     отправителя как админа. Помогает проверить настройку ADMIN_IDS без
-    необходимости лезть в Railway и разглядывать скриншоты."""
+    необходимости лезть в .env и разглядывать скриншоты."""
     uid = message.from_user.id
     if uid in ADMIN_IDS:
         await message.answer(
@@ -794,7 +794,8 @@ async def cmd_amiadmin(message: Message):
             f"Твой настоящий id: <code>{uid}</code>\n"
             f"Список админов, который сейчас загружен в бота: {admins_list}\n"
             f"Сырое значение переменной ADMIN_IDS прямо сейчас: <code>{raw_env!r}</code>\n\n"
-            f"Нужно, чтобы в Railway → Variables → ADMIN_IDS было записано ровно это число: <code>{uid}</code>"
+            f"Нужно, чтобы в файле .env на сервере в переменной ADMIN_IDS было записано ровно это число: <code>{uid}</code> "
+            f"(и после изменения .env — перезапустить бота)."
         )
 
 
