@@ -57,3 +57,20 @@ def check_answer(user_text: str, clue: dict) -> bool:
             if normalize(ans) == normalized_user:
                 return True
     return False
+
+
+def check_keywords(user_text: str, clue: dict) -> bool:
+    """Проверяет ответ пользователя на вхождение хотя бы одного из
+    "keywords" (в отличие от check_answer, тут не нужно точное совпадение —
+    достаточно, чтобы нормализованный ответ пользователя содержал одно из
+    ключевых слов/словосочетаний, например "я у дворца Паскевичей" засчитает
+    ключевое слово "дворец"."""
+    keywords = clue.get("keywords", [])
+    normalized_user = normalize(user_text)
+    if not normalized_user:
+        return False
+    for kw in keywords:
+        normalized_kw = normalize(kw)
+        if normalized_kw and normalized_kw in normalized_user:
+            return True
+    return False

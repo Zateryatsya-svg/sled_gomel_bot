@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 import certificate
 import collage
 import storage
-from answer_utils import check_answer
+from answer_utils import check_answer, check_keywords
 
 # ---------------------------------------------------------------------------
 # Инициализация
@@ -178,8 +178,18 @@ async def get_active_state(user_id: int) -> tuple[dict | None, bool]:
     return state, False
 
 
-def arrival_keyboard(with_hint: bool = False) -> InlineKeyboardMarkup:
-    rows = []
+def coins_row(coins: int | None) -> list:
+    """Маленькая неактивная (по сути) кнопка с балансом монет — чтобы он
+    был виден на экране почти всегда, пока идёт игра. Монеты появляются
+    после первой награды (reward_coins у бита) и тратятся на подсказки
+    (см. hint_cost_coins)."""
+    if coins is None:
+        return []
+    return [[InlineKeyboardButton(text=f"🪙 Монеты: {coins}", callback_data="coins_info")]]
+
+
+def arrival_keyboard(with_hint: bool = False, coins: int | None = None) -> InlineKeyboardMarkup:
+    rows = coins_row(coins)
     if with_hint:
         rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")])
         rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")])
@@ -202,13 +212,17 @@ def photo_request_keyboard(show_skip: bool = True) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def question_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")],
-            [InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")],
-        ]
-    )
+def question_keyboard(beat: dict | None = None, coins: int | None = None) -> InlineKeyboardMarkup | None:
+    rows = coins_row(coins)
+    # Некоторые вопросы (например, самая первая разминочная загадка у ворот)
+    # намеренно идут без кнопок "Думать самому"/"Подсказка" — см. "no_buttons"
+    # у бита в content.json.
+    if not (beat and beat.get("no_buttons")):
+        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")])
+        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def start_quest_keyboard() -> InlineKeyboardMarkup:
@@ -578,7 +592,10 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             continue
 
         if kind == "arrival":
-            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"), reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint"))))
+            await send_narrative(
+                bot, chat_id, beat["text"], beat.get("speaker"),
+                reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint")), coins=state.get("coins")),
+            )
             await storage.save_state(state)
             followup = beat.get("delayed_followup")
             if followup:
@@ -604,6 +621,15 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             return
 
         if kind == "collect_name":
+            await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
+            await storage.save_state(state)
+            return
+
+        if kind == "location_check":
+            # Игрок должен написать текстом, у какого здания он находится —
+            # ответ сверяется не точным совпадением, а по вхождению одного
+            # из "keywords" (см. answer_utils.check_keywords), обработка
+            # текста — в handle_answer.
             await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
             await storage.save_state(state)
             return
@@ -657,7 +683,7 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             continue
 
         if kind == "question":
-            await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard())
+            await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard(beat, coins=state.get("coins")))
             await storage.save_state(state)
             _question_shown_at[user_id] = time.time()
             # Подсказка больше не приходит автоматически по таймеру — только
@@ -979,10 +1005,26 @@ async def cb_finish_quest(callback: CallbackQuery, bot: Bot):
     await callback.message.answer("Спасибо, что прошёл(а) этот маршрут! До новых прогулок 🌿")
 
 
+@router.callback_query(F.data == "coins_info")
+async def cb_coins_info(callback: CallbackQuery, bot: Bot):
+    """Нажатие на саму кнопку-индикатор монет — просто показывает баланс
+    всплывающим уведомлением, шаг квеста не двигаем."""
+    user_id = callback.from_user.id
+    state, expired = await get_active_state(user_id)
+    balance = state.get("coins", 0) if state else 0
+    await callback.answer(
+        f"🪙 У тебя {balance} монет(а). Их можно менять на подсказки!",
+        show_alert=True,
+    )
+
+
 @router.callback_query(F.data == "hint")
 async def cb_hint(callback: CallbackQuery, bot: Bot):
     """«💡 Нужна подсказка» — присылает подсказку по запросу сразу, не
-    дожидаясь автоматической отложенной отправки."""
+    дожидаясь автоматической отложенной отправки. Подсказка стоит монету
+    (см. hint_cost_coins у бита в content.json, по умолчанию 1) — списываем
+    её перед показом, а если монет не хватает — предлагаем сначала
+    заработать."""
     await safe_answer(callback)
     user_id = callback.from_user.id
     state, expired = await get_active_state(user_id)
@@ -995,8 +1037,22 @@ async def cb_hint(callback: CallbackQuery, bot: Bot):
     if beat is None or beat["kind"] not in ("question", "arrival"):
         return
     hint_text = beat.get("hint")
-    if hint_text:
-        await callback.message.answer(hint_text)
+    if not hint_text:
+        return
+    cost = beat.get("hint_cost_coins", 1)
+    if cost:
+        balance = state.get("coins", 0)
+        if balance < cost:
+            await callback.message.answer(
+                f"🪙 Для этой подсказки нужна {cost} монета, а у тебя пока {balance}. "
+                "Монеты можно заработать за некоторые верные ответы по ходу игры."
+            )
+            return
+        state["coins"] = balance - cost
+        await storage.save_state(state)
+        await callback.message.answer(hint_text + f"\n\n🪙 Остаток монет: {state['coins']}")
+        return
+    await callback.message.answer(hint_text)
 
 
 @router.callback_query(F.data == "photo_req_skip")
@@ -1197,6 +1253,21 @@ async def handle_answer(message: Message, bot: Bot):
         await advance_quest(user_id, chat_id, bot, state)
         return
 
+    if beat["kind"] == "location_check":
+        if check_keywords(user_text, beat):
+            cancel_hint_task(user_id)
+            if beat.get("correct_reply"):
+                await message.answer(beat["correct_reply"])
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            await advance_quest(user_id, chat_id, bot, state)
+        else:
+            await message.answer(
+                beat.get("wrong_reply")
+                or "Хм, кажется, это не то здание 🤔 Оглядись ещё раз и напиши, где ты находишься."
+            )
+        return
+
     if beat["kind"] != "question":
         # человек написал что-то текстом там, где сейчас ждём не ответ, а
         # нажатие кнопки (arrival/wait_ready) — просто мягко напоминаем.
@@ -1214,8 +1285,14 @@ async def handle_answer(message: Message, bot: Bot):
                 state["fast_answer_count"] = state.get("fast_answer_count", 0) + 1
                 await send_narrative(bot, chat_id, item["text"], item.get("speaker"))
 
-        if beat.get("correct_reply"):
-            await message.answer(beat["correct_reply"])
+        reward = beat.get("reward_coins")
+        reply = beat.get("correct_reply") or ""
+        if reward:
+            state["coins"] = state.get("coins", 0) + reward
+            reply = (reply + f"\n\n🪙 +{reward} монета! Теперь у тебя {state['coins']} 🪙 — их можно "
+                              "менять на подсказки.").strip()
+        if reply:
+            await message.answer(reply)
         state["clue_idx"] += 1
         await storage.save_state(state)
         await advance_quest(user_id, chat_id, bot, state)
