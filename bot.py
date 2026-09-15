@@ -188,6 +188,15 @@ def coins_row(coins: int | None) -> list:
     return [[InlineKeyboardButton(text=f"🪙 Монеты: {coins}", callback_data="coins_info")]]
 
 
+def visible_coins(state: dict) -> int | None:
+    """Баланс монет для отображения в клавиатуре — но только после того,
+    как игрок получил первую монету (coins_unlocked). До этого момента
+    строку с монетами вообще не показываем."""
+    if not state.get("coins_unlocked"):
+        return None
+    return state.get("coins", 0)
+
+
 def arrival_keyboard(with_hint: bool = False, coins: int | None = None) -> InlineKeyboardMarkup:
     rows = coins_row(coins)
     if with_hint:
@@ -594,7 +603,7 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         if kind == "arrival":
             await send_narrative(
                 bot, chat_id, beat["text"], beat.get("speaker"),
-                reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint")), coins=state.get("coins")),
+                reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint")), coins=visible_coins(state)),
             )
             await storage.save_state(state)
             followup = beat.get("delayed_followup")
@@ -683,7 +692,7 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             continue
 
         if kind == "question":
-            await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard(beat, coins=state.get("coins")))
+            await bot.send_message(chat_id, beat["question"], reply_markup=question_keyboard(beat, coins=visible_coins(state)))
             await storage.save_state(state)
             _question_shown_at[user_id] = time.time()
             # Подсказка больше не приходит автоматически по таймеру — только
@@ -1289,6 +1298,7 @@ async def handle_answer(message: Message, bot: Bot):
         reply = beat.get("correct_reply") or ""
         if reward:
             state["coins"] = state.get("coins", 0) + reward
+            state["coins_unlocked"] = True
             reply = (reply + f"\n\n🪙 +{reward} монета! Теперь у тебя {state['coins']} 🪙 — их можно "
                               "менять на подсказки.").strip()
         if reply:

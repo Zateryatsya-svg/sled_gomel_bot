@@ -108,6 +108,12 @@ async def init_db():
             await db.execute("ALTER TABLE user_state ADD COLUMN coins INTEGER NOT NULL DEFAULT 0")
         except Exception:
             pass
+        # индикатор монет на экране показываем только после того, как игрок
+        # получил самую первую монету — до этого строку монет не рисуем
+        try:
+            await db.execute("ALTER TABLE user_state ADD COLUMN coins_unlocked INTEGER NOT NULL DEFAULT 0")
+        except Exception:
+            pass
         await db.commit()
 
 
@@ -139,6 +145,7 @@ async def get_state(user_id: int) -> dict | None:
                 "fast_answer_count": row["fast_answer_count"] if "fast_answer_count" in row.keys() else 0,
                 "wrong_answer_count": row["wrong_answer_count"] if "wrong_answer_count" in row.keys() else 0,
                 "coins": row["coins"] if "coins" in row.keys() else 0,
+                "coins_unlocked": bool(row["coins_unlocked"]) if "coins_unlocked" in row.keys() else False,
             }
 
 
@@ -149,9 +156,9 @@ async def save_state(state: dict):
             """
             INSERT INTO user_state (
                 user_id, step_idx, clue_idx, letters, mode, finished, code, think_count,
-                updated_at, reminder_sent, player_name, long_think_count, fast_answer_count, wrong_answer_count, coins
+                updated_at, reminder_sent, player_name, long_think_count, fast_answer_count, wrong_answer_count, coins, coins_unlocked
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 step_idx = excluded.step_idx,
                 clue_idx = excluded.clue_idx,
@@ -166,7 +173,8 @@ async def save_state(state: dict):
                 long_think_count = excluded.long_think_count,
                 fast_answer_count = excluded.fast_answer_count,
                 wrong_answer_count = excluded.wrong_answer_count,
-                coins = excluded.coins
+                coins = excluded.coins,
+                coins_unlocked = excluded.coins_unlocked
             """,
             (
                 state["user_id"],
@@ -183,6 +191,7 @@ async def save_state(state: dict):
                 state.get("fast_answer_count", 0),
                 state.get("wrong_answer_count", 0),
                 state.get("coins", 0),
+                int(bool(state.get("coins_unlocked", False))),
             ),
         )
         await db.commit()
@@ -239,6 +248,7 @@ async def reset_state(user_id: int):
         "fast_answer_count": 0,
         "wrong_answer_count": 0,
         "coins": 0,
+        "coins_unlocked": False,
     }
     await save_state(fresh)
     await clear_quest_photos(user_id)
@@ -260,6 +270,7 @@ def new_state(user_id: int) -> dict:
         "fast_answer_count": 0,
         "wrong_answer_count": 0,
         "coins": 0,
+        "coins_unlocked": False,
     }
 
 
