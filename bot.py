@@ -206,6 +206,14 @@ def arrival_keyboard(with_hint: bool = False, coins: int | None = None) -> Inlin
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def reveal_photo_keyboard(button_label: str | None = None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=button_label or "Что здесь интересного?", callback_data="reveal_photo")]
+        ]
+    )
+
+
 def wait_ready_keyboard(label: str | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -307,6 +315,17 @@ async def begin_quest_intro(bot: Bot, chat_id: int):
     player_name = (state or {}).get("player_name") or ""
     intro_text = CONTENT["intro"]["text"].replace("{name}", player_name)
     await bot.send_message(chat_id, intro_text, reply_markup=start_quest_keyboard())
+
+
+async def force_restart(user_id: int, chat_id: int, bot: Bot):
+    """Полный рестарт прогресса без выбора «Продолжить» — по решению Тони
+    оставляем только «Начать заново», чтобы нельзя было обойти квест через
+    лазейку с «Продолжить». Код и имя игрока сохраняются (см. reset_state),
+    оплата повторно не запрашивается — она привязана к коду один раз, а не
+    к каждому заходу."""
+    cancel_hint_task(user_id)
+    await storage.reset_state(user_id)
+    await begin_quest_intro(bot, chat_id)
 
 
 PAYMENT_QR_PATH = "assets/payment_qr.png"
@@ -430,7 +449,7 @@ async def try_activate_code(message: Message, raw_code: str):
             await message.answer("Ты уже прошёл(а) это расследование с этим кодом! 🏆")
             return
         if state["step_idx"] >= 0:
-            await message.answer(CONTENT["resume_prompt"], reply_markup=resume_keyboard())
+            await force_restart(user_id, message.chat.id, message.bot)
         else:
             await begin_quest_intro(message.bot, message.chat.id)
         return
@@ -601,6 +620,13 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             continue
 
         if kind == "arrival":
+            images = beat.get("images") or []
+            if images:
+                media = [
+                    InputMediaPhoto(media=FSInputFile(p), caption=None)
+                    for p in images
+                ]
+                await bot.send_media_group(chat_id, media=media)
             await send_narrative(
                 bot, chat_id, beat["text"], beat.get("speaker"),
                 reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint")), coins=visible_coins(state)),
@@ -640,6 +666,16 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             # из "keywords" (см. answer_utils.check_keywords), обработка
             # текста — в handle_answer.
             await send_narrative(bot, chat_id, beat["text"], beat.get("speaker"))
+            await storage.save_state(state)
+            return
+
+        if kind == "photo_reveal":
+            # Текст с кнопкой "Что здесь интересного?" — фото показываем
+            # только по нажатию (см. cb_reveal_photo), не сразу.
+            await send_narrative(
+                bot, chat_id, beat["text"], beat.get("speaker"),
+                reply_markup=reveal_photo_keyboard(beat.get("button_label")),
+            )
             await storage.save_state(state)
             return
 
@@ -740,7 +776,7 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot):
             )
             return
         if state["step_idx"] >= 0:
-            await message.answer(CONTENT["resume_prompt"], reply_markup=resume_keyboard())
+            await force_restart(user_id, message.chat.id, message.bot)
         else:
             await begin_quest_intro(message.bot, message.chat.id)
         return
@@ -918,10 +954,7 @@ async def cb_resume_continue(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "resume_restart")
 async def cb_resume_restart(callback: CallbackQuery, bot: Bot):
     await safe_answer(callback)
-    user_id = callback.from_user.id
-    cancel_hint_task(user_id)
-    await storage.reset_state(user_id)
-    await begin_quest_intro(bot, callback.message.chat.id)
+    await force_restart(callback.from_user.id, callback.message.chat.id, bot)
 
 
 @router.callback_query(F.data == "quest_start")
@@ -957,6 +990,34 @@ async def cb_arrived(callback: CallbackQuery, bot: Bot):
     state["clue_idx"] += 1
     await storage.save_state(state)
     await advance_quest(user_id, callback.message.chat.id, bot, state)
+
+
+@router.callback_query(F.data == "reveal_photo")
+async def cb_reveal_photo(callback: CallbackQuery, bot: Bot):
+    """Кнопка «Что здесь интересного?» — показываем фото только сейчас,
+    по нажатию, а не сразу вместе с текстом (см. kind="photo_reveal")."""
+    await safe_answer(callback)
+    user_id = callback.from_user.id
+    chat_id = callback.message.chat.id
+    state, expired = await get_active_state(user_id)
+    if state is None or state["finished"]:
+        return
+    if expired:
+        await begin_quest_intro(bot, chat_id)
+        return
+    beat = current_beat(state)
+    if beat is None or beat["kind"] != "photo_reveal":
+        return
+    images = beat.get("images") or []
+    if images:
+        media = [
+            InputMediaPhoto(media=FSInputFile(p), caption=beat.get("caption", "") if i == 0 else None)
+            for i, p in enumerate(images)
+        ]
+        await bot.send_media_group(chat_id, media=media)
+    state["clue_idx"] += 1
+    await storage.save_state(state)
+    await advance_quest(user_id, chat_id, bot, state)
 
 
 @router.callback_query(F.data == "wait_ready")
