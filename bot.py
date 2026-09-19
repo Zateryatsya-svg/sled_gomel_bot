@@ -200,7 +200,6 @@ def visible_coins(state: dict) -> int | None:
 def arrival_keyboard(with_hint: bool = False, coins: int | None = None) -> InlineKeyboardMarkup:
     rows = coins_row(coins)
     if with_hint:
-        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")])
         rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")])
     rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["arrived"], callback_data="arrived")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -231,11 +230,10 @@ def photo_request_keyboard(show_skip: bool = True) -> InlineKeyboardMarkup:
 
 def question_keyboard(beat: dict | None = None, coins: int | None = None) -> InlineKeyboardMarkup | None:
     rows = coins_row(coins)
-    # Некоторые вопросы (например, самая первая разминочная загадка у ворот)
-    # намеренно идут без кнопок "Думать самому"/"Подсказка" — см. "no_buttons"
-    # у бита в content.json.
+    # Кнопка «Подумаю сам» убрана из квеста полностью. Некоторые вопросы
+    # (например, самая первая разминочная загадка у ворот) идут вообще без
+    # кнопок — см. "no_buttons" у бита в content.json.
     if not (beat and beat.get("no_buttons")):
-        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["think"], callback_data="think")])
         rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")])
     if not rows:
         return None
@@ -443,6 +441,11 @@ async def try_activate_code(message: Message, raw_code: str):
         state = await storage.get_state(user_id)
         if state is None:
             state = storage.new_state(user_id)
+            state["code"] = code
+            await storage.save_state(state)
+        elif state.get("code") != code:
+            # состояние было сброшено (например, повторным /start) —
+            # возвращаем привязку кода, иначе бот не узнает оплатившего
             state["code"] = code
             await storage.save_state(state)
         if state["finished"]:
@@ -757,6 +760,25 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
 # Хендлеры команд
 # ---------------------------------------------------------------------------
 
+# True — каждый /start (без кода в ссылке) начинает всё заново с экрана оплаты.
+# False — прежнее поведение (у оплатившего /start сбрасывает только прогресс).
+# Можно переключить без правки кода: переменная окружения START_ALWAYS_FROM_PAYMENT=0.
+START_ALWAYS_FROM_PAYMENT = os.getenv("START_ALWAYS_FROM_PAYMENT", "1") != "0"
+
+
+async def restart_from_payment(user_id: int, chat_id: int, bot: Bot):
+    """Полный сброс до состояния «ещё не платил»: прогресс, монеты, имя,
+    фото и привязка кода в состоянии игрока. Сам код в таблице кодов НЕ
+    освобождаем (не revoke) — чужой человек не сможет его перехватить, а
+    сам игрок вернёт доступ, открыв свою ссылку/QR с кодом ещё раз."""
+    cancel_hint_task(user_id)
+    _question_shown_at.pop(user_id, None)
+    _awaiting_review.discard(user_id)
+    await storage.clear_quest_photos(user_id)
+    await storage.save_state(storage.new_state(user_id))
+    await send_payment_instructions(bot, chat_id)
+
+
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject, bot: Bot):
     user_id = message.from_user.id
@@ -765,6 +787,10 @@ async def cmd_start(message: Message, command: CommandObject, bot: Bot):
     # Пользователь пришёл по персональной ссылке/QR вида t.me/bot?start=КОД
     if command.args:
         await try_activate_code(message, command.args)
+        return
+
+    if START_ALWAYS_FROM_PAYMENT:
+        await restart_from_payment(user_id, message.chat.id, message.bot)
         return
 
     state = await storage.get_state(user_id)
@@ -1355,15 +1381,21 @@ async def handle_answer(message: Message, bot: Bot):
                 idx = state.get("fast_answer_count", 0) % len(bank)
                 item = bank[idx]
                 state["fast_answer_count"] = state.get("fast_answer_count", 0) + 1
-                await send_narrative(bot, chat_id, item["text"], item.get("speaker"))
+                # Без send_narrative: у реплик со speaker="tonya" там пауза
+                # 30 сек, а эта реплика идёт ПЕРЕД основным ответом — из-за
+                # неё всё дальнейшее «тормозило» после быстрого ответа.
+                await bot.send_message(chat_id, item["text"])
 
-        reward = beat.get("reward_coins")
+        reward = beat.get("reward_coins", 1)
         reply = beat.get("correct_reply") or ""
         if reward:
+            first_coin = not state.get("coins_unlocked")
             state["coins"] = state.get("coins", 0) + reward
             state["coins_unlocked"] = True
-            reply = (reply + f"\n\n🪙 +{reward} монета! Теперь у тебя {state['coins']} 🪙 — их можно "
-                              "менять на подсказки.").strip()
+            coin_line = f"🪙 +{reward} монета! Теперь у тебя {state['coins']} 🪙"
+            if first_coin:
+                coin_line += " — их можно менять на подсказки."
+            reply = (reply + "\n\n" + coin_line).strip()
         if reply:
             await message.answer(reply)
         state["clue_idx"] += 1
