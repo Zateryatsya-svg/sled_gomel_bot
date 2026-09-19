@@ -600,6 +600,14 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
             await storage.save_state(state)
             continue
 
+        if kind == "voice":
+            # Голосовое сообщение. Файл должен быть OGG с кодеком OPUS — иначе
+            # Telegram покажет его как обычное аудио, а не как голосовое.
+            await bot.send_voice(chat_id, FSInputFile(beat["file"]))
+            state["clue_idx"] += 1
+            await storage.save_state(state)
+            continue
+
         if kind == "photo":
             images = beat.get("images") or []
             if images:
