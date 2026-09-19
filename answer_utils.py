@@ -33,6 +33,24 @@ def extract_number(text: str):
         return None
 
 
+def edit_distance(a: str, b: str) -> int:
+    """Расстояние Левенштейна: сколько букв нужно вставить/убрать/заменить,
+    чтобы из одной строки получить другую."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
 def check_answer(user_text: str, clue: dict) -> bool:
     """Проверяет ответ пользователя против описания вопроса (clue/step).
 
@@ -52,9 +70,16 @@ def check_answer(user_text: str, clue: dict) -> bool:
 
     accepted = clue.get("answers", [])
     normalized_user = normalize(user_text)
+    # "fuzzy": N у бита в content.json — допускаем до N ошибок в буквах
+    # (опечатка, лишняя/пропущенная буква). Только для ответов от 6 букв,
+    # чтобы короткие слова не путались между собой.
+    fuzzy = int(clue.get("fuzzy", 0) or 0)
     if normalized_user:
         for ans in accepted:
-            if normalize(ans) == normalized_user:
+            normalized_ans = normalize(ans)
+            if normalized_ans == normalized_user:
+                return True
+            if fuzzy and len(normalized_ans) >= 6 and edit_distance(normalized_ans, normalized_user) <= fuzzy:
                 return True
     return False
 
