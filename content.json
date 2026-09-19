@@ -317,7 +317,9 @@
         },
         {
           "kind": "voice",
-          "file": "assets/voice_flower.ogg"
+          "file": "assets/voice_flower.ogg",
+          "duration_sec": 36,
+          "wait_after_sec": 40
         },
         {
           "kind": "text",

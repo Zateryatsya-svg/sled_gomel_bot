@@ -603,7 +603,13 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         if kind == "voice":
             # Голосовое сообщение. Файл должен быть OGG с кодеком OPUS — иначе
             # Telegram покажет его как обычное аудио, а не как голосовое.
-            await bot.send_voice(chat_id, FSInputFile(beat["file"]))
+            await bot.send_voice(chat_id, FSInputFile(beat["file"]), duration=beat.get("duration_sec"))
+            # Telegram не сообщает боту, дослушал ли человек голосовое, поэтому
+            # следующее сообщение выдерживаем по длине записи (wait_after_sec =
+            # длительность + небольшой запас). Пока идёт пауза, текст игрока
+            # игнорируется — текущий бит не вопрос.
+            if beat.get("wait_after_sec"):
+                await asyncio.sleep(beat["wait_after_sec"])
             state["clue_idx"] += 1
             await storage.save_state(state)
             continue
