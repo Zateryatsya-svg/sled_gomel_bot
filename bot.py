@@ -1287,10 +1287,7 @@ async def cb_photo_req_info(callback: CallbackQuery, bot: Bot):
     """Кнопка-подсказка «📸 Отправить фото» — сама отправка происходит
     обычным сообщением с фото, кнопка просто напоминает, как это сделать."""
     await safe_answer(callback)
-    await callback.message.answer(
-        "Отправь селфи так же, как скриншот оплаты: нажми на скрепку слева от строки сообщения "
-        "(внизу экрана), сделай снимок камерой или выбери фото из галереи — и отправь сюда, в чат."
-    )
+    await callback.message.answer("Отправь фото в чат! Лодочник и рысь уже заняли позу и ждут 😄")
 
 
 @router.callback_query(F.data.startswith("confirm_pay:"))
