@@ -38,7 +38,7 @@ from dotenv import load_dotenv
 import certificate
 import collage
 import storage
-from answer_utils import check_answer, check_keywords
+from answer_utils import check_answer, check_keywords, normalize
 
 # ---------------------------------------------------------------------------
 # Инициализация
@@ -93,6 +93,10 @@ _question_shown_at: dict[int, float] = {}
 # бот перезапустится между нажатием и текстом, отзыв просто не долетит
 # до админов, это не влияет на прохождение квеста)
 _awaiting_review: set[int] = set()
+# Игроки, которым задан вопрос «Ты уже спускаешься?» (delayed_followup с
+# кнопками Да/Нет) и которые ещё не ответили: {user_id: {...}}. Не
+# персистентно — при перезапуске бота отложенная сцена просто не сработает.
+_spooky_pending: dict[int, dict] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +117,7 @@ def cancel_hint_task(user_id: int):
     aside_task = _aside_tasks.pop(user_id, None)
     if aside_task and not aside_task.done():
         aside_task.cancel()
+    _spooky_pending.pop(user_id, None)
 
 
 TONYA_SPEAKER_DELAY_SEC = int(os.getenv("TONYA_SPEAKER_DELAY_SEC", "30"))  # 30 секунд в проде
@@ -475,27 +480,96 @@ def current_beat(state: dict) -> dict | None:
     return beats[state["clue_idx"]]
 
 
+async def run_spooky_branch(bot: Bot, chat_id: int, items: list[dict]):
+    """Отправляет цепочку реплик ветки: у каждой может быть delay_sec —
+    пауза ПЕРЕД этой репликой."""
+    for item in items:
+        delay = item.get("delay_sec", 0)
+        if delay:
+            await asyncio.sleep(delay)
+        await bot.send_message(chat_id, item["text"])
+
+
+def spooky_keyboard(followup: dict) -> InlineKeyboardMarkup:
+    labels = followup.get("buttons") or {}
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=labels.get("yes", "Да"), callback_data="spooky:yes"),
+        InlineKeyboardButton(text=labels.get("no", "Нет"), callback_data="spooky:no"),
+    ]])
+
+
 async def schedule_arrival_followup(user_id: int, chat_id: int, bot: Bot, followup: dict, step_idx_snapshot: int, beat_idx_snapshot: int):
-    """Через N секунд, если пользователь всё ещё не нажал «Я пришёл» на этой
-    же точке (например, R. отправил его не туда), шлёт сообщение-поправку.
-    Отменяется автоматически, как только человек реально дошёл и нажал
-    кнопку — см. cancel_hint_task() в cb_arrived."""
+    """Через delay_sec, если игрок всё ещё не нажал «Я на локации» на этой же
+    точке, шлёт сообщение-вопрос. Если в followup заданы ветки (yes / no /
+    silence) — к вопросу добавляются кнопки Да/Нет, и после silence_after_sec
+    без ответа уходит ветка silence. Всё отменяется автоматически, как
+    только человек нажал кнопку (см. cancel_hint_task() в cb_arrived)."""
     delay = followup.get("delay_sec", 300)
     text = followup.get("text")
     if not text:
         return
-    try:
-        await asyncio.sleep(delay)
-        state = await storage.get_state(user_id)
-        if (
+
+    def still_here(state) -> bool:
+        return bool(
             state
             and not state["finished"]
             and state["step_idx"] == step_idx_snapshot
             and state["clue_idx"] == beat_idx_snapshot
-        ):
+        )
+
+    try:
+        await asyncio.sleep(delay)
+        state = await storage.get_state(user_id)
+        if not still_here(state):
+            return
+        if not (followup.get("yes") or followup.get("no") or followup.get("silence")):
             await bot.send_message(chat_id, text)
+            return
+        sent = await bot.send_message(chat_id, text, reply_markup=spooky_keyboard(followup))
+        _spooky_pending[user_id] = {
+            "followup": followup, "chat_id": chat_id, "message_id": sent.message_id,
+        }
+        await asyncio.sleep(followup.get("silence_after_sec", 180))
+        state = await storage.get_state(user_id)
+        if _spooky_pending.pop(user_id, None) is not None and still_here(state):
+            try:
+                await bot.edit_message_reply_markup(chat_id=chat_id, message_id=sent.message_id, reply_markup=None)
+            except Exception:
+                pass
+            await run_spooky_branch(bot, chat_id, followup.get("silence") or [])
     except asyncio.CancelledError:
         pass
+
+
+SPOOKY_YES_WORDS = {"да", "ага", "угу", "конечно", "yes"}
+SPOOKY_NO_WORDS = {"нет", "неа", "no", "ещенет"}
+
+
+def spooky_choice_from_text(text: str) -> str | None:
+    """Печатный ответ «да»/«нет» на вопрос «Ты уже спускаешься?»."""
+    n = normalize(text or "")
+    if n in SPOOKY_YES_WORDS:
+        return "yes"
+    if n in SPOOKY_NO_WORDS:
+        return "no"
+    return None
+
+
+async def answer_spooky(user_id: int, bot: Bot, choice: str) -> bool:
+    """Игрок ответил на «Ты уже спускаешься?» (кнопкой или текстом)."""
+    pending = _spooky_pending.pop(user_id, None)
+    if pending is None:
+        return False
+    task = _hint_tasks.pop(user_id, None)
+    if task and not task.done():
+        task.cancel()
+    chat_id = pending["chat_id"]
+    try:
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=pending["message_id"], reply_markup=None)
+    except Exception:
+        pass
+    await run_spooky_branch(bot, chat_id, pending["followup"].get(choice) or [])
+    return True
 
 
 async def schedule_long_think(user_id: int, chat_id: int, bot: Bot, step_idx_snapshot: int, beat_idx_snapshot: int):
@@ -1026,6 +1100,12 @@ async def cb_quest_start(callback: CallbackQuery, bot: Bot):
     await advance_quest(user_id, callback.message.chat.id, bot, state)
 
 
+@router.callback_query(F.data.in_({"spooky:yes", "spooky:no"}))
+async def cb_spooky(callback: CallbackQuery, bot: Bot):
+    await safe_answer(callback)
+    await answer_spooky(callback.from_user.id, bot, callback.data.split(":")[1])
+
+
 @router.callback_query(F.data == "arrived")
 async def cb_arrived(callback: CallbackQuery, bot: Bot):
     """Игрок физически дошёл до точки и нажал «📍 Я пришёл»."""
@@ -1391,6 +1471,12 @@ async def handle_answer(message: Message, bot: Bot):
                 or "Хм, кажется, это не то здание 🤔 Оглядись ещё раз и напиши, где ты находишься."
             )
         return
+
+    if user_id in _spooky_pending:
+        choice = spooky_choice_from_text(user_text)
+        if choice:
+            await answer_spooky(user_id, bot, choice)
+            return
 
     if beat["kind"] != "question":
         # человек написал что-то текстом там, где сейчас ждём не ответ, а
