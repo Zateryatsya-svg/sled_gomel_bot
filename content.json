@@ -320,11 +320,14 @@
           "kind": "voice",
           "file": "assets/voice_flower.ogg",
           "duration_sec": 36,
-          "wait_after_sec": 40
+          "wait_after_sec": 90,
+          "delete_after_wait": true,
+          "deleted_notice": "<i>Сообщение удалено</i>",
+          "notice_pause_sec": 3
         },
         {
           "kind": "text",
-          "text": "Не обращай внимания на это сообщение, тоже нас пытаются запутать. Просто пошли искать нужную нам локацию."
+          "text": "Не обращай внимания на это сообщение. Видимо, нас пытаются запугать."
         },
         {
           "kind": "question",

@@ -603,13 +603,25 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
         if kind == "voice":
             # Голосовое сообщение. Файл должен быть OGG с кодеком OPUS — иначе
             # Telegram покажет его как обычное аудио, а не как голосовое.
-            await bot.send_voice(chat_id, FSInputFile(beat["file"]), duration=beat.get("duration_sec"))
+            voice_msg = await bot.send_voice(chat_id, FSInputFile(beat["file"]), duration=beat.get("duration_sec"))
             # Telegram не сообщает боту, дослушал ли человек голосовое, поэтому
             # следующее сообщение выдерживаем по длине записи (wait_after_sec =
             # длительность + небольшой запас). Пока идёт пауза, текст игрока
             # игнорируется — текущий бит не вопрос.
             if beat.get("wait_after_sec"):
                 await asyncio.sleep(beat["wait_after_sec"])
+            # "Самоудаление": голосовое стирается, на его месте появляется
+            # короткая надпись, и только потом идёт следующее сообщение.
+            if beat.get("delete_after_wait"):
+                deleted = False
+                try:
+                    await bot.delete_message(chat_id, voice_msg.message_id)
+                    deleted = True
+                except Exception:
+                    logger.warning("Не удалось удалить голосовое у %s", chat_id, exc_info=True)
+                if deleted and beat.get("deleted_notice"):
+                    await bot.send_message(chat_id, beat["deleted_notice"])
+                    await asyncio.sleep(beat.get("notice_pause_sec", 2))
             state["clue_idx"] += 1
             await storage.save_state(state)
             continue
