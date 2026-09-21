@@ -205,7 +205,9 @@ def visible_coins(state: dict) -> int | None:
 def arrival_keyboard(with_hint: bool = False, coins: int | None = None) -> InlineKeyboardMarkup:
     rows = coins_row(coins)
     if with_hint:
-        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint")])
+        # hint_arr — подсказка именно этого сообщения-ориентира; она остаётся
+        # рабочей и после нажатия «Я на локации» (см. cb_hint_arrival).
+        rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint_arr")])
     rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["arrived"], callback_data="arrived")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1222,28 +1224,21 @@ async def cb_coins_info(callback: CallbackQuery, bot: Bot):
     )
 
 
-@router.callback_query(F.data == "hint")
-async def cb_hint(callback: CallbackQuery, bot: Bot):
-    """«💡 Нужна подсказка» — присылает подсказку по запросу сразу, не
-    дожидаясь автоматической отложенной отправки. Подсказка стоит монету
-    (см. hint_cost_coins у бита в content.json, по умолчанию 1) — списываем
-    её перед показом, а если монет не хватает — предлагаем сначала
-    заработать."""
-    await safe_answer(callback)
-    user_id = callback.from_user.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
-        return
-    if expired:
-        await begin_quest_intro(bot, callback.message.chat.id)
-        return
-    beat = current_beat(state)
-    if beat is None or beat["kind"] not in ("question", "arrival"):
-        return
-    hint_text = beat.get("hint")
-    if not hint_text:
-        return
-    cost = beat.get("hint_cost_coins", 1)
+def find_arrival_hint_beat(state) -> dict | None:
+    """Ближайший назад (включая текущий) бит-ориентир (arrival) этого шага,
+    у которого есть подсказка."""
+    beats = STEPS[state["step_idx"]]["beats"]
+    for i in range(min(state["clue_idx"], len(beats) - 1), -1, -1):
+        if beats[i]["kind"] == "arrival":
+            return beats[i] if beats[i].get("hint") else None
+    return None
+
+
+async def send_hint(callback: CallbackQuery, state, hint_beat: dict):
+    """Списывает монету (hint_cost_coins, по умолчанию 1) и показывает
+    подсказку; если монет не хватает — предлагает сначала заработать."""
+    hint_text = hint_beat["hint"]
+    cost = hint_beat.get("hint_cost_coins", 1)
     if cost:
         balance = state.get("coins", 0)
         if balance < cost:
@@ -1257,6 +1252,47 @@ async def cb_hint(callback: CallbackQuery, bot: Bot):
         await callback.message.answer(hint_text + f"\n\n🪙 Остаток монет: {state['coins']}")
         return
     await callback.message.answer(hint_text)
+
+
+@router.callback_query(F.data == "hint")
+async def cb_hint(callback: CallbackQuery, bot: Bot):
+    """«💡 Подсказка» под вопросом. Если у текущего вопроса своей подсказки
+    нет — показываем подсказку сообщения-ориентира этого шага."""
+    await safe_answer(callback)
+    user_id = callback.from_user.id
+    state, expired = await get_active_state(user_id)
+    if state is None or state["finished"]:
+        return
+    if expired:
+        await begin_quest_intro(bot, callback.message.chat.id)
+        return
+    beat = current_beat(state)
+    hint_beat = None
+    if beat is not None and beat["kind"] in ("question", "arrival") and beat.get("hint"):
+        hint_beat = beat
+    else:
+        hint_beat = find_arrival_hint_beat(state)
+    if hint_beat is None:
+        return
+    await send_hint(callback, state, hint_beat)
+
+
+@router.callback_query(F.data == "hint_arr")
+async def cb_hint_arrival(callback: CallbackQuery, bot: Bot):
+    """«💡 Подсказка» под сообщением-ориентиром. Доступна в любой момент,
+    в том числе после «📍 Я на локации»."""
+    await safe_answer(callback)
+    user_id = callback.from_user.id
+    state, expired = await get_active_state(user_id)
+    if state is None or state["finished"]:
+        return
+    if expired:
+        await begin_quest_intro(bot, callback.message.chat.id)
+        return
+    hint_beat = find_arrival_hint_beat(state)
+    if hint_beat is None:
+        return
+    await send_hint(callback, state, hint_beat)
 
 
 @router.callback_query(F.data == "photo_req_skip")
