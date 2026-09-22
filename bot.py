@@ -574,6 +574,21 @@ async def answer_spooky(user_id: int, bot: Bot, choice: str) -> bool:
     return True
 
 
+async def schedule_arrival_voice(user_id: int, chat_id: int, bot: Bot, voice: dict, step_idx_snapshot: int):
+    """Атмосферное голосовое, независимое от кнопки «Я на локации» и от
+    _hint_tasks (значит, не отменяется, когда игрок нажимает кнопку). Не
+    отправляется, если игрок за это время ушёл дальше по квесту (сменился
+    шаг) или квест уже завершён."""
+    try:
+        await asyncio.sleep(voice.get("delay_sec", 120))
+        state = await storage.get_state(user_id)
+        if not state or state["finished"] or state["step_idx"] != step_idx_snapshot:
+            return
+        await bot.send_voice(chat_id, FSInputFile(voice["file"]), duration=voice.get("duration_sec"))
+    except asyncio.CancelledError:
+        pass
+
+
 async def schedule_long_think(user_id: int, chat_id: int, bot: Bot, step_idx_snapshot: int, beat_idx_snapshot: int):
     """Через LONG_THINK_AFTER_SEC молчания на вопросе шлёт подбадривающую
     фразу из банка long_think_replies (по кругу, на весь квест). Отдельный
@@ -745,6 +760,15 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
                     schedule_arrival_followup(user_id, chat_id, bot, followup, state["step_idx"], state["clue_idx"])
                 )
                 _hint_tasks[user_id] = task
+            delayed_voice = beat.get("delayed_voice")
+            if delayed_voice:
+                # Атмосферное голосовое, независимое от кнопки «Я на локации»:
+                # приходит через delay_sec после ЭТОГО сообщения-ориентира,
+                # даже если игрок уже успел нажать кнопку и продвинуться
+                # дальше по этому же шагу (но не после смены шага/финиша).
+                asyncio.create_task(
+                    schedule_arrival_voice(user_id, chat_id, bot, delayed_voice, state["step_idx"])
+                )
             # Подсказка больше не приходит автоматически по таймеру — только
             # по нажатию кнопки "💡 Подсказка" (см. cb_hint), даже если
             # человек долго не отвечает.
