@@ -202,13 +202,13 @@ def visible_coins(state: dict) -> int | None:
     return state.get("coins", 0)
 
 
-def arrival_keyboard(with_hint: bool = False, coins: int | None = None) -> InlineKeyboardMarkup:
+def arrival_keyboard(with_hint: bool = False, coins: int | None = None, arrived_label: str | None = None) -> InlineKeyboardMarkup:
     rows = coins_row(coins)
     if with_hint:
         # hint_arr — подсказка именно этого сообщения-ориентира; она остаётся
         # рабочей и после нажатия «Я на локации» (см. cb_hint_arrival).
         rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["hint"], callback_data="hint_arr")])
-    rows.append([InlineKeyboardButton(text=CONTENT["buttons"]["arrived"], callback_data="arrived")])
+    rows.append([InlineKeyboardButton(text=arrived_label or CONTENT["buttons"]["arrived"], callback_data="arrived")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -751,7 +751,7 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
                 await bot.send_media_group(chat_id, media=media)
             await send_narrative(
                 bot, chat_id, beat["text"], beat.get("speaker"),
-                reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint")), coins=visible_coins(state)),
+                reply_markup=arrival_keyboard(with_hint=bool(beat.get("hint")), coins=visible_coins(state), arrived_label=beat.get("arrived_button_label")),
             )
             await storage.save_state(state)
             followup = beat.get("delayed_followup")
