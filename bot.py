@@ -97,6 +97,20 @@ _awaiting_review: set[int] = set()
 # кнопками Да/Нет) и которые ещё не ответили: {user_id: {...}}. Не
 # персистентно — при перезапуске бота отложенная сцена просто не сработает.
 _spooky_pending: dict[int, dict] = {}
+# Пер-игроковая блокировка на время выполнения advance_quest(). Если игрок
+# несколько раз подряд тапнул кнопку до того, как бот успел ответить (а
+# advance_quest может занимать секунды из-за пауз между сообщениями), лишние
+# нажатия просто игнорируются — вместо того чтобы каждое из них заново
+# отправляло всю цепочку сообщений.
+_advance_locks: dict[int, asyncio.Lock] = {}
+
+
+def get_advance_lock(user_id: int) -> asyncio.Lock:
+    lock = _advance_locks.get(user_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _advance_locks[user_id] = lock
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -1137,19 +1151,23 @@ async def cb_arrived(callback: CallbackQuery, bot: Bot):
     """Игрок физически дошёл до точки и нажал «📍 Я пришёл»."""
     await safe_answer(callback)
     user_id = callback.from_user.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
+    lock = get_advance_lock(user_id)
+    if lock.locked():
         return
-    if expired:
-        await begin_quest_intro(bot, callback.message.chat.id)
-        return
-    beat = current_beat(state)
-    if beat is None or beat["kind"] != "arrival":
-        return
-    cancel_hint_task(user_id)
-    state["clue_idx"] += 1
-    await storage.save_state(state)
-    await advance_quest(user_id, callback.message.chat.id, bot, state)
+    async with lock:
+        state, expired = await get_active_state(user_id)
+        if state is None or state["finished"]:
+            return
+        if expired:
+            await begin_quest_intro(bot, callback.message.chat.id)
+            return
+        beat = current_beat(state)
+        if beat is None or beat["kind"] != "arrival":
+            return
+        cancel_hint_task(user_id)
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, callback.message.chat.id, bot, state)
 
 
 @router.callback_query(F.data == "reveal_photo")
@@ -1159,25 +1177,29 @@ async def cb_reveal_photo(callback: CallbackQuery, bot: Bot):
     await safe_answer(callback)
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
+    lock = get_advance_lock(user_id)
+    if lock.locked():
         return
-    if expired:
-        await begin_quest_intro(bot, chat_id)
-        return
-    beat = current_beat(state)
-    if beat is None or beat["kind"] != "photo_reveal":
-        return
-    images = beat.get("images") or []
-    if images:
-        media = [
-            InputMediaPhoto(media=FSInputFile(p), caption=beat.get("caption", "") if i == 0 else None)
-            for i, p in enumerate(images)
-        ]
-        await bot.send_media_group(chat_id, media=media)
-    state["clue_idx"] += 1
-    await storage.save_state(state)
-    await advance_quest(user_id, chat_id, bot, state)
+    async with lock:
+        state, expired = await get_active_state(user_id)
+        if state is None or state["finished"]:
+            return
+        if expired:
+            await begin_quest_intro(bot, chat_id)
+            return
+        beat = current_beat(state)
+        if beat is None or beat["kind"] != "photo_reveal":
+            return
+        images = beat.get("images") or []
+        if images:
+            media = [
+                InputMediaPhoto(media=FSInputFile(p), caption=beat.get("caption", "") if i == 0 else None)
+                for i, p in enumerate(images)
+            ]
+            await bot.send_media_group(chat_id, media=media)
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, chat_id, bot, state)
 
 
 @router.callback_query(F.data == "wait_ready")
@@ -1185,19 +1207,23 @@ async def cb_wait_ready(callback: CallbackQuery, bot: Bot):
     """Игрок нажал кнопку «Готов» на точке отдыха (без ответа на вопрос)."""
     await safe_answer(callback)
     user_id = callback.from_user.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
+    lock = get_advance_lock(user_id)
+    if lock.locked():
         return
-    if expired:
-        await begin_quest_intro(bot, callback.message.chat.id)
-        return
-    beat = current_beat(state)
-    if beat is None or beat["kind"] != "wait_ready":
-        return
-    cancel_hint_task(user_id)
-    state["clue_idx"] += 1
-    await storage.save_state(state)
-    await advance_quest(user_id, callback.message.chat.id, bot, state)
+    async with lock:
+        state, expired = await get_active_state(user_id)
+        if state is None or state["finished"]:
+            return
+        if expired:
+            await begin_quest_intro(bot, callback.message.chat.id)
+            return
+        beat = current_beat(state)
+        if beat is None or beat["kind"] != "wait_ready":
+            return
+        cancel_hint_task(user_id)
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, callback.message.chat.id, bot, state)
 
 
 @router.callback_query(F.data == "think")
