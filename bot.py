@@ -603,6 +603,21 @@ async def schedule_arrival_voice(user_id: int, chat_id: int, bot: Bot, voice: di
         pass
 
 
+async def schedule_arrival_message(user_id: int, chat_id: int, bot: Bot, msg: dict, step_idx_snapshot: int):
+    """Атмосферная текстовая реплика («кто-то наблюдает за игроком»), как
+    schedule_arrival_voice, только текстом: приходит через delay_sec после
+    сообщения-ориентира, независимо от кнопки «Я на локации», и не приходит,
+    если игрок уже сменил шаг или квест завершён."""
+    try:
+        await asyncio.sleep(msg.get("delay_sec", 240))
+        state = await storage.get_state(user_id)
+        if not state or state["finished"] or state["step_idx"] != step_idx_snapshot:
+            return
+        await bot.send_message(chat_id, msg["text"])
+    except asyncio.CancelledError:
+        pass
+
+
 async def schedule_long_think(user_id: int, chat_id: int, bot: Bot, step_idx_snapshot: int, beat_idx_snapshot: int):
     """Через LONG_THINK_AFTER_SEC молчания на вопросе шлёт подбадривающую
     фразу из банка long_think_replies (по кругу, на весь квест). Отдельный
@@ -782,6 +797,13 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
                 # дальше по этому же шагу (но не после смены шага/финиша).
                 asyncio.create_task(
                     schedule_arrival_voice(user_id, chat_id, bot, delayed_voice, state["step_idx"])
+                )
+            for delayed_msg in beat.get("delayed_messages", []):
+                # Атмосферные текстовые реплики «кто-то наблюдает за игроком» —
+                # та же логика, что и delayed_voice, только текстом. Можно
+                # задать несколько штук с разными delay_sec у одного beat'а.
+                asyncio.create_task(
+                    schedule_arrival_message(user_id, chat_id, bot, delayed_msg, state["step_idx"])
                 )
             # Подсказка больше не приходит автоматически по таймеру — только
             # по нажатию кнопки "💡 Подсказка" (см. cb_hint), даже если
