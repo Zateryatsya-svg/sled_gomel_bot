@@ -316,11 +316,8 @@
         {
           "kind": "voice",
           "file": "assets/voice_flower.ogg",
-          "duration_sec": 36,
-          "wait_after_sec": 40,
-          "delete_after_wait": true,
-          "deleted_notice": "<i>Сообщение удалено</i>",
-          "notice_pause_sec": 3,
+          "duration_sec": 66,
+          "wait_after_sec": 70,
           "delay_before_sec": 20
         },
         {
