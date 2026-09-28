@@ -18,22 +18,58 @@ Pillow гораздо легче собирается из исходников 
 он и так уже используется в проекте для сертификата (certificate.py).
 """
 
+import datetime
 import io
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 
 COLLAGE_TEMPLATE_PATH = "assets/collage_template.png"
+COLLAGE_FONT_PATH = "assets/certificate_font.ttf"
 
 # Координаты подобраны вручную/полуавтоматически под конкретный шаблон
-# 1536x1024 (см. эксперименты в разработке). Каждая рамка задана 4
-# точками в порядке [top-left, top-right, bottom-right, bottom-left].
-# "boatman" — первое фото по ходу квеста (бронзовый дуэт), "tower" —
-# второе (селфи у башни), "final" — третье (у лавочек).
+# 1024x1024 (скрапбук-коллаж «Пройдено и запечатлено», see assets/
+# collage_template.png). Каждая рамка задана 4 точками в порядке
+# [top-left, top-right, bottom-right, bottom-left]. "boatman" — первое
+# фото по ходу квеста (у Лодочника), "tower" — второе (селфи у башни),
+# "final" — третье (у лавочек).
 FRAME_QUADS = {
-    "boatman": [(819, 85), (1341, 23), (1373, 290), (852, 352)],
-    "tower": [(1147, 300), (1554, 327), (1534, 636), (1127, 609)],
-    "final": [(952, 581), (1474, 682), (1411, 1001), (891, 899)],
+    "boatman": [(439, 102), (793, 57), (829, 339), (474, 384)],
+    "tower": [(89, 410), (529, 361), (565, 681), (125, 730)],
+    "final": [(504, 642), (896, 663), (881, 938), (489, 917)],
 }
+
+# Коричневая лента внизу справа — сюда вписывается дата прохождения
+# квеста. Лента идёт по диагонали, поэтому дату разворачиваем на
+# DATE_ANGLE градусов (положительное значение = против часовой стрелки
+# в терминах PIL.Image.rotate).
+DATE_AREA_CENTER = (852, 944)
+DATE_ANGLE = 10
+DATE_FONT_SIZE = 22
+DATE_COLOR = (70, 48, 30)
+
+
+def _stamp_date(template: Image.Image, date_str: str | None = None) -> Image.Image:
+    """Печатает дату прохождения на коричневой ленте шаблона. По
+    умолчанию — сегодняшняя дата (момент вызова, то есть момент, когда
+    игрок реально закончил квест), в формате ДД.ММ.ГГГГ."""
+    if date_str is None:
+        date_str = datetime.datetime.now().strftime("%d.%m.%Y")
+    try:
+        font = ImageFont.truetype(COLLAGE_FONT_PATH, DATE_FONT_SIZE)
+    except Exception:
+        font = ImageFont.load_default()
+
+    tmp = Image.new("RGBA", (400, 120), (0, 0, 0, 0))
+    d = ImageDraw.Draw(tmp)
+    bbox = d.textbbox((0, 0), date_str, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    d.text((200 - tw / 2 - bbox[0], 60 - th / 2 - bbox[1]), date_str, fill=DATE_COLOR, font=font)
+
+    rotated = tmp.rotate(DATE_ANGLE, expand=True, resample=Image.BICUBIC)
+    template = template.convert("RGBA")
+    px, py = DATE_AREA_CENTER
+    template.paste(rotated, (px - rotated.width // 2, py - rotated.height // 2), rotated)
+    return template.convert("RGB")
 
 
 def _order_points(pts):
@@ -102,7 +138,7 @@ def _cover_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
     return img.resize((target_w, target_h), Image.LANCZOS)
 
 
-def _paste_photo_into_quad(template: Image.Image, photo: Image.Image, quad_pts) -> Image.Image:
+def _paste_photo_into_quad(template: Image.Image, photo: Image.Image, quad_pts, window_mask: Image.Image | None = None) -> Image.Image:
     dst = _order_points(quad_pts)
     tl, tr, br, bl = dst
 
@@ -120,8 +156,14 @@ def _paste_photo_into_quad(template: Image.Image, photo: Image.Image, quad_pts) 
     canvas_size = template.size
     warped = fitted.transform(canvas_size, Image.PERSPECTIVE, coeffs, Image.BICUBIC)
 
-    mask = Image.new("L", canvas_size, 0)
-    ImageDraw.Draw(mask).polygon([tuple(p) for p in dst], fill=255)
+    if window_mask is not None:
+        # Точная маска белого окна шаблона: фото закрывает его целиком
+        # (включая места, где раньше была «зелень»), но не вылезает на
+        # бумажную рамку.
+        mask = window_mask
+    else:
+        mask = Image.new("L", canvas_size, 0)
+        ImageDraw.Draw(mask).polygon([tuple(p) for p in dst], fill=255)
 
     result = template.copy()
     result.paste(warped, (0, 0), mask)
@@ -143,7 +185,13 @@ def generate_collage_png(photos: dict) -> bytes:
             photo.load()
         except Exception:
             continue
-        result = _paste_photo_into_quad(result, photo, quad)
+        try:
+            window_mask = Image.open(f"assets/collage_mask_{slot}.png").convert("L")
+        except Exception:
+            window_mask = None
+        result = _paste_photo_into_quad(result, photo, quad, window_mask)
+
+    result = _stamp_date(result)
 
     buf = io.BytesIO()
     result.save(buf, format="PNG")
