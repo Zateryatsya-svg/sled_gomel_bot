@@ -140,6 +140,14 @@ def _cover_crop(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
 
 def _paste_photo_into_quad(template: Image.Image, photo: Image.Image, quad_pts, window_mask: Image.Image | None = None) -> Image.Image:
     dst = _order_points(quad_pts)
+    if window_mask is not None:
+        # Растягиваем квад на ~6% от центра, чтобы фото гарантированно
+        # перекрывало окно с запасом (маска потом обрежет всё лишнее по
+        # бумажной рамке) — иначе у краёв окна может остаться тонкая
+        # полоска без фото.
+        cx = sum(p[0] for p in dst) / 4
+        cy = sum(p[1] for p in dst) / 4
+        dst = [(cx + (x - cx) * 1.06, cy + (y - cy) * 1.06) for x, y in dst]
     tl, tr, br, bl = dst
 
     def dist(p1, p2):
