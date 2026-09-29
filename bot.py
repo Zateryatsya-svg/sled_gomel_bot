@@ -1332,21 +1332,25 @@ async def cb_hint(callback: CallbackQuery, bot: Bot):
     нет — показываем подсказку сообщения-ориентира этого шага."""
     await safe_answer(callback)
     user_id = callback.from_user.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
+    lock = get_advance_lock(user_id)
+    if lock.locked():
         return
-    if expired:
-        await begin_quest_intro(bot, callback.message.chat.id)
-        return
-    beat = current_beat(state)
-    hint_beat = None
-    if beat is not None and beat["kind"] in ("question", "arrival") and beat.get("hint"):
-        hint_beat = beat
-    else:
-        hint_beat = find_arrival_hint_beat(state)
-    if hint_beat is None:
-        return
-    await send_hint(callback, state, hint_beat)
+    async with lock:
+        state, expired = await get_active_state(user_id)
+        if state is None or state["finished"]:
+            return
+        if expired:
+            await begin_quest_intro(bot, callback.message.chat.id)
+            return
+        beat = current_beat(state)
+        hint_beat = None
+        if beat is not None and beat["kind"] in ("question", "arrival") and beat.get("hint"):
+            hint_beat = beat
+        else:
+            hint_beat = find_arrival_hint_beat(state)
+        if hint_beat is None:
+            return
+        await send_hint(callback, state, hint_beat)
 
 
 @router.callback_query(F.data == "hint_arr")
@@ -1355,16 +1359,20 @@ async def cb_hint_arrival(callback: CallbackQuery, bot: Bot):
     в том числе после «📍 Я на локации»."""
     await safe_answer(callback)
     user_id = callback.from_user.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
+    lock = get_advance_lock(user_id)
+    if lock.locked():
         return
-    if expired:
-        await begin_quest_intro(bot, callback.message.chat.id)
-        return
-    hint_beat = find_arrival_hint_beat(state)
-    if hint_beat is None:
-        return
-    await send_hint(callback, state, hint_beat)
+    async with lock:
+        state, expired = await get_active_state(user_id)
+        if state is None or state["finished"]:
+            return
+        if expired:
+            await begin_quest_intro(bot, callback.message.chat.id)
+            return
+        hint_beat = find_arrival_hint_beat(state)
+        if hint_beat is None:
+            return
+        await send_hint(callback, state, hint_beat)
 
 
 @router.callback_query(F.data == "photo_req_skip")
@@ -1372,22 +1380,26 @@ async def cb_photo_req_skip(callback: CallbackQuery, bot: Bot):
     """Игрок нажал «➡️ Пропустить» вместо того, чтобы прислать селфи."""
     await safe_answer(callback)
     user_id = callback.from_user.id
-    state, expired = await get_active_state(user_id)
-    if state is None or state["finished"]:
+    lock = get_advance_lock(user_id)
+    if lock.locked():
         return
-    if expired:
-        await begin_quest_intro(bot, callback.message.chat.id)
-        return
-    beat = current_beat(state)
-    if beat is None or beat.get("kind") != "photo_request":
-        return
-    cancel_hint_task(user_id)
-    reply = beat.get("skip_reply")
-    if reply:
-        await callback.message.answer(reply)
-    state["clue_idx"] += 1
-    await storage.save_state(state)
-    await advance_quest(user_id, callback.message.chat.id, bot, state)
+    async with lock:
+        state, expired = await get_active_state(user_id)
+        if state is None or state["finished"]:
+            return
+        if expired:
+            await begin_quest_intro(bot, callback.message.chat.id)
+            return
+        beat = current_beat(state)
+        if beat is None or beat.get("kind") != "photo_request":
+            return
+        cancel_hint_task(user_id)
+        reply = beat.get("skip_reply")
+        if reply:
+            await callback.message.answer(reply)
+        state["clue_idx"] += 1
+        await storage.save_state(state)
+        await advance_quest(user_id, callback.message.chat.id, bot, state)
 
 
 @router.callback_query(F.data == "photo_req_info")
