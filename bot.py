@@ -911,6 +911,19 @@ async def advance_quest(user_id: int, chat_id: int, bot: Bot, state: dict):
                     schedule_question_aside(user_id, chat_id, bot, beat["tonya_aside"], state["step_idx"], state["clue_idx"])
                 )
                 _aside_tasks[user_id] = aside_task
+            delayed_voice_q = beat.get("delayed_voice")
+            if delayed_voice_q:
+                # Тот же приём, что и у сообщений-ориентиров: голосовое
+                # приходит фоном через delay_sec ПОСЛЕ этого вопроса (кнопка
+                # подсказки уже видна к этому моменту), независимо от того,
+                # успел ли игрок ответить.
+                asyncio.create_task(
+                    schedule_arrival_voice(user_id, chat_id, bot, delayed_voice_q, state["step_idx"])
+                )
+            for delayed_msg_q in beat.get("delayed_messages", []):
+                asyncio.create_task(
+                    schedule_arrival_message(user_id, chat_id, bot, delayed_msg_q, state["step_idx"])
+                )
             return
 
         # неизвестный тип бита — на всякий случай не зависаем молча
