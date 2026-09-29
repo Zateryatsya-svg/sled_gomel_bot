@@ -1214,11 +1214,15 @@ async def cb_reveal_photo(callback: CallbackQuery, bot: Bot):
             return
         images = beat.get("images") or []
         if images:
-            media = [
-                InputMediaPhoto(media=FSInputFile(p), caption=beat.get("caption", "") if i == 0 else None)
-                for i, p in enumerate(images)
-            ]
+            media = [InputMediaPhoto(media=FSInputFile(p)) for p in images]
             await bot.send_media_group(chat_id, media=media)
+            caption = beat.get("caption")
+            if caption:
+                # Подпись идёт отдельным сообщением через пару секунд ПОСЛЕ
+                # картинок, а не приклеена к ним — так текст читается уже
+                # после того, как человек рассмотрел фото.
+                await asyncio.sleep(1.5)
+                await bot.send_message(chat_id, caption)
         state["clue_idx"] += 1
         await storage.save_state(state)
         await advance_quest(user_id, chat_id, bot, state)
