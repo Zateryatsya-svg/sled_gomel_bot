@@ -1422,12 +1422,19 @@ async def cb_photo_req_skip(callback: CallbackQuery, bot: Bot):
 @router.callback_query(F.data == "photo_req_info")
 async def cb_photo_req_info(callback: CallbackQuery, bot: Bot):
     """Кнопка-подсказка «📸 Отправить фото» — сама отправка происходит
-    обычным сообщением с фото, кнопка просто напоминает, как это сделать."""
+    обычным сообщением с фото, кнопка просто напоминает, как это сделать.
+    Текст берётся из текущего бита (photo_req_info_text), если он задан —
+    иначе используется общий текст по умолчанию."""
     await safe_answer(callback)
-    await callback.message.answer(
+    user_id = callback.from_user.id
+    state, expired = await get_active_state(user_id)
+    beat = current_beat(state) if state and not expired else None
+    text = (beat or {}).get(
+        "photo_req_info_text",
         "Просто отправь фото сейчас в чат — и приступим к следующему заданию. "
-        "Время не тратим: нам же ещё надо отгадать загадку!"
+        "Время не тратим: нам же ещё надо отгадать загадку!",
     )
+    await callback.message.answer(text)
 
 
 @router.callback_query(F.data.startswith("confirm_pay:"))
