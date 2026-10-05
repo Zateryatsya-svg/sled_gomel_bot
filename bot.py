@@ -18,7 +18,9 @@ import os
 import re
 import secrets
 import time
+import urllib.parse
 
+import aiohttp
 import qrcode
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -59,6 +61,35 @@ if not BOT_TOKEN:
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()
 }
+
+# Необязательное дублирование срочных уведомлений (заявки на оплату) в
+# WhatsApp через CallMeBot — бесплатно, тот же apikey подходит и для
+# платного звонка (https://www.callmebot.com/phone-call/), если он
+# понадобится позже — тогда достаточно сменить /whatsapp.php на /call.php
+# ниже. Если переменные не заданы, уведомление просто не отправляется.
+CALLMEBOT_PHONE = os.getenv("CALLMEBOT_PHONE", "").strip()
+CALLMEBOT_APIKEY = os.getenv("CALLMEBOT_APIKEY", "").strip()
+
+
+async def notify_whatsapp(text: str) -> None:
+    """Дублирует срочное уведомление в WhatsApp через CallMeBot.
+    Не критично для работы бота — любая ошибка только логируется."""
+    if not (CALLMEBOT_PHONE and CALLMEBOT_APIKEY):
+        return
+    url = (
+        "https://api.callmebot.com/whatsapp.php"
+        f"?phone={urllib.parse.quote(CALLMEBOT_PHONE)}"
+        f"&text={urllib.parse.quote(text)}"
+        f"&apikey={urllib.parse.quote(CALLMEBOT_APIKEY)}"
+    )
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    logger.warning(f"CallMeBot ответил {resp.status}: {body[:200]}")
+    except Exception as e:
+        logger.warning(f"Не удалось отправить уведомление в WhatsApp: {e}")
 
 with open("content.json", encoding="utf-8") as f:
     CONTENT = json.load(f)
@@ -397,6 +428,7 @@ async def forward_payment_claim(message: Message, bot: Bot):
         label = buyer_label(message)
         header = f"{CONTENT['payment']['admin_notify_prefix']}\nОт: {label}"
         kb = confirm_payment_keyboard(message.from_user.id)
+        asyncio.create_task(notify_whatsapp(f"🔔 Новая заявка на оплату SLED\nОт: {label}"))
         for admin_id in ADMIN_IDS:
             try:
                 if message.photo:
